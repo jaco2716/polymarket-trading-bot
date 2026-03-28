@@ -36,8 +36,10 @@ All other values are optional — defaults from `.env.example` apply. The `.env`
 **Start the bot** (runs continuously, scans every hour by default):
 
 ```bash
-python3 polymarket_bot.py
+caffeinate -i python3 polymarket_bot.py
 ```
+
+`caffeinate` is built into macOS and prevents your Mac from sleeping while the bot runs. When you stop the bot with `Ctrl+C`, sleep behaviour returns to normal.
 
 **Start the dashboard** (open in a second terminal while the bot is running):
 
@@ -90,6 +92,8 @@ Set `STRATEGY_MODE` in `.env` to control how strategies interact:
 | `shadow` | No real trades placed. All three strategies are evaluated and logged to `shadow_trades` — use this to compare strategies risk-free before committing budget |
 
 **Recommended flow:** run `shadow` mode for a few weeks to collect data, check the Shadow Comparison tab in the dashboard, then switch to `compete` or `parallel` using the strategy that performed best.
+
+In `compete` and `parallel` mode, the bot will never open a second position on a market where a trade is already open. Shadow mode is unrestricted — contradictory signals on the same market are kept as useful data.
 
 ### Whale Discovery
 

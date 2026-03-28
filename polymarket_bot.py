@@ -168,6 +168,11 @@ def save_budget(b: float):
 def open_trade_count(con) -> int:
     return con.execute("SELECT COUNT(*) FROM trades WHERE resolved=0").fetchone()[0]
 
+def open_market_ids(con) -> set:
+    """Return market IDs that already have an open (unresolved) real trade."""
+    rows = con.execute("SELECT market_id FROM trades WHERE resolved=0").fetchall()
+    return {r[0] for r in rows}
+
 # ── Fee calculation ───────────────────────────────────────────────────────────
 def calc_fee(amount: float, price: float, order_type: str = "taker") -> float:
     """
@@ -814,7 +819,7 @@ def _run_haiku_slot(con, budget: float, markets: list[dict], traded: set,
         time.sleep(0.5)
         if not analysis or not analysis.get("edge"):
             continue
-        conf      = analysis.get("confidence", 0)
+        conf      = float(analysis.get("confidence") or 0)
         min_conf  = CFG["SHADOW_HAIKU_MIN_CONF"] if shadow else CFG["HAIKU_MIN_CONF"]
         if conf < min_conf:
             continue
@@ -870,7 +875,7 @@ def _run_whale_slot(con, budget: float, whale_signal: Optional[dict], traded: se
         log.info("[whale-copy] Copying whale signal directly...")
 
     if shadow:
-        conf = analysis.get("confidence") if confirm_with_haiku and analysis else None
+        conf = float(analysis.get("confidence") or 0) if confirm_with_haiku and analysis else None
         log_shadow_trade(con, tags[0], m, dir_, price, confidence=conf)
         traded.add(m["id"])
         return budget, 1, 1
@@ -902,7 +907,13 @@ def run_scan(con):
 
     signals_found = 0
     trades_placed = 0
-    traded_this_scan: set = set()
+    # In real modes, pre-seed with markets that already have an open trade
+    # so we never open a second position on the same market.
+    # Shadow mode is unrestricted — contradictory signals are useful data.
+    if mode == "shadow":
+        traded_this_scan: set = set()
+    else:
+        traded_this_scan: set = open_market_ids(con)
 
     # Fetch whale signal once — shared by both whale slots
     whale_signal = None
