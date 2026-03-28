@@ -66,6 +66,11 @@ CFG = {
     "MAX_OPEN_TRADES":    int(os.getenv("MAX_OPEN_TRADES", "10")),
     "SCAN_INTERVAL":      int(os.getenv("SCAN_INTERVAL",   "3600")),     # seconds between scans
 
+    # Strategy mode
+    # "compete"  — strategies share 3 trade slots per scan (default)
+    # "parallel" — each strategy gets its own slot; use this to A/B test
+    "STRATEGY_MODE":      os.getenv("STRATEGY_MODE", "compete"),
+
     # Whale wallet addresses to track (comma-separated env var or add below)
     "WHALE_WALLETS": [
         w.strip() for w in os.getenv("WHALE_WALLETS", "").split(",") if w.strip()
@@ -113,6 +118,22 @@ def init_db():
             markets_checked INTEGER,
             signals_found   INTEGER,
             trades_placed   INTEGER
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS shadow_trades (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts          TEXT    NOT NULL,
+            strategy    TEXT    NOT NULL,   -- haiku-analyse | whale-copy | whale+haiku
+            market_id   TEXT    NOT NULL,
+            market_name TEXT    NOT NULL,
+            direction   TEXT    NOT NULL,
+            price       REAL    NOT NULL,
+            amount      REAL    NOT NULL,   -- hypothetical stake (no real budget impact)
+            resolved    INTEGER DEFAULT 0,
+            outcome     TEXT,
+            pnl         REAL,
+            close_ts    TEXT
         )
     """)
     con.commit()
@@ -641,6 +662,66 @@ def resolve_settled_trades(con) -> float:
         save_budget(budget)
     return total_pnl
 
+# ── Shadow trade engine ───────────────────────────────────────────────────────
+def log_shadow_trade(con, strategy: str, market: dict, direction: str, price: float):
+    """Record a hypothetical trade with no budget impact."""
+    amount = round(CFG["STARTING_BUDGET"] * CFG["TRADE_SIZE_PCT"], 2)
+    con.execute("""
+        INSERT INTO shadow_trades
+            (ts, strategy, market_id, market_name, direction, price, amount)
+        VALUES (?,?,?,?,?,?,?)
+    """, (
+        datetime.now(timezone.utc).isoformat(),
+        strategy,
+        market["id"],
+        market["name"],
+        direction,
+        price,
+        amount,
+    ))
+    con.commit()
+    log.info(
+        f"👻 Shadow [{strategy}]: {direction.upper()} on '{market['name'][:55]}' @ {price:.3f}"
+    )
+
+def resolve_shadow_trades(con):
+    """Check open shadow trades against market outcomes and record hypothetical P&L."""
+    rows = con.execute(
+        "SELECT id, market_id, direction, price, amount FROM shadow_trades WHERE resolved=0"
+    ).fetchall()
+    if not rows:
+        return
+
+    for row_id, market_id, direction, price, amount in rows:
+        data = get(f"{GAMMA_URL}/markets/{market_id}")
+        if not data:
+            continue
+        m = data[0] if isinstance(data, list) else data
+        if not m.get("closed") and not m.get("resolved"):
+            continue
+
+        winner = None
+        if m.get("winner"):
+            winner = str(m["winner"]).lower()
+        elif m.get("resolvedAt") or m.get("resolution"):
+            res = str(m.get("resolution") or "").lower()
+            winner = "yes" if res in ("1", "true", "yes") else "no"
+        if not winner:
+            continue
+
+        won = (direction == winner)
+        pnl = amount * (1 - price) / price if won else -amount
+
+        con.execute("""
+            UPDATE shadow_trades SET resolved=1, outcome=?, pnl=?, close_ts=? WHERE id=?
+        """, (winner, round(pnl, 4), datetime.now(timezone.utc).isoformat(), row_id))
+        con.commit()
+        log.info(
+            f"👻 Shadow resolved #{row_id}: {'WON' if won else 'LOST'} "
+            f"hypothetical P&L: {pnl:+.2f} USDC"
+        )
+        time.sleep(0.2)
+
 # ── Stats printer ─────────────────────────────────────────────────────────────
 def print_stats(con):
     rows = con.execute("""
@@ -686,20 +767,115 @@ def print_stats(con):
             wr = f"{s['wins']/s['count']*100:.0f}%" if s["count"] else "—"
             log.info(f"    [{tag}]  {s['count']} trades  wr={wr}  P&L={s['pnl']:+.2f}")
 
+    # Shadow trade comparison
+    shadow_rows = con.execute("""
+        SELECT strategy,
+               COUNT(*) as total,
+               SUM(CASE WHEN resolved=1 THEN 1 ELSE 0 END) as resolved,
+               SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
+               ROUND(SUM(COALESCE(pnl, 0)), 2) as total_pnl
+        FROM shadow_trades
+        GROUP BY strategy
+    """).fetchall()
+    if shadow_rows:
+        log.info("  Shadow strategy comparison (hypothetical, no real budget):")
+        for strategy, total, resolved, wins, spnl in sorted(shadow_rows, key=lambda x: -(x[4] or 0)):
+            wr = f"{wins/resolved*100:.0f}%" if resolved else "n/a"
+            log.info(f"    [{strategy}]  {total} evaluated  wr={wr}  hypothetical P&L={spnl:+.2f}")
+
+# ── Shared strategy helpers ────────────────────────────────────────────────────
+def _run_haiku_slot(con, budget: float, markets: list[dict], traded: set,
+                    shadow: bool = False) -> tuple[float, int, int]:
+    """Run the standalone Haiku strategy. Returns (new_budget, signals, trades)."""
+    signals = trades = 0
+    log.info(f"[haiku-analyse] Scanning top {min(10, len(markets))} markets...")
+    for m in markets[:10]:
+        if m["id"] in traded:
+            continue
+        if not shadow and open_trade_count(con) >= CFG["MAX_OPEN_TRADES"]:
+            break
+        analysis = haiku_analyse(m)
+        time.sleep(0.5)
+        if not analysis or not analysis.get("edge"):
+            continue
+        if analysis.get("confidence", 0) < CFG["HAIKU_MIN_CONF"]:
+            continue
+        signals += 1
+        dir_  = analysis.get("direction", "yes")
+        price = m["yes_price"] if dir_ == "yes" else m["no_price"]
+        if shadow:
+            log_shadow_trade(con, "haiku-analyse", m, dir_, price)
+        else:
+            otype = analysis.get("order_type", "maker")
+            new_budget = place_paper_trade(
+                con, budget, m, dir_, price, otype,
+                tags=["haiku-analyse"], notes=analysis.get("reasoning", ""),
+            )
+            if new_budget is not None:
+                budget = new_budget
+        trades += 1
+        traded.add(m["id"])
+        break  # one trade per slot
+    return budget, signals, trades
+
+
+def _run_whale_slot(con, budget: float, whale_signal: Optional[dict], traded: set,
+                    confirm_with_haiku: bool, shadow: bool = False) -> tuple[float, int, int]:
+    """
+    Run a whale-based strategy slot.
+    confirm_with_haiku=False → pure whale-copy
+    confirm_with_haiku=True  → whale+haiku
+    Returns (new_budget, signals, trades).
+    """
+    if not whale_signal or whale_signal["market"]["id"] in traded:
+        return budget, 0, 0
+
+    m     = whale_signal["market"]
+    dir_  = whale_signal["direction"]
+    price = whale_signal["price"]
+    otype = "taker"
+    tags  = ["whale-copy"]
+    notes = whale_signal["notes"]
+
+    if confirm_with_haiku:
+        log.info("[whale+haiku] Confirming whale signal with Haiku...")
+        analysis = haiku_analyse(m)
+        if not analysis:
+            return budget, 1, 0
+        if not analysis.get("edge") or analysis.get("confidence", 0) < CFG["HAIKU_MIN_CONF"]:
+            log.info("[whale+haiku] Haiku rejected signal — skipping")
+            return budget, 1, 0
+        tags  = ["whale+haiku"]
+        otype = analysis.get("order_type", "taker")
+        notes += f" | Haiku conf={analysis['confidence']:.2f}: {analysis.get('reasoning','')}"
+    else:
+        log.info("[whale-copy] Copying whale signal directly...")
+
+    if shadow:
+        log_shadow_trade(con, tags[0], m, dir_, price)
+        traded.add(m["id"])
+        return budget, 1, 1
+
+    new_budget = place_paper_trade(con, budget, m, dir_, price, otype, tags, notes)
+    if new_budget is not None:
+        traded.add(m["id"])
+        return new_budget, 1, 1
+    return budget, 1, 0
+
+
 # ── Main scan loop ─────────────────────────────────────────────────────────────
 def run_scan(con):
     budget = load_budget()
-    log.info(f"\n{'═'*55}\n  🔍 Starting scan  |  Budget: ${budget:.2f}\n{'═'*55}")
+    mode   = CFG["STRATEGY_MODE"]
+    log.info(f"\n{'═'*55}\n  🔍 Starting scan  |  Budget: ${budget:.2f}  |  mode={mode}\n{'═'*55}")
 
-    # First, resolve any settled open trades
     resolve_settled_trades(con)
+    resolve_shadow_trades(con)
 
-    # Check capacity
-    if open_trade_count(con) >= CFG["MAX_OPEN_TRADES"]:
+    if mode != "shadow" and open_trade_count(con) >= CFG["MAX_OPEN_TRADES"]:
         log.info("At max open trades — skipping new entries this scan")
         return
 
-    # Fetch live markets
     markets = fetch_markets()
     if not markets:
         log.warning("No markets returned — API may be down")
@@ -707,91 +883,60 @@ def run_scan(con):
 
     signals_found = 0
     trades_placed = 0
-    # Track which market IDs we already traded this scan to avoid duplication
     traded_this_scan: set = set()
 
-    # ── Strategy: Whale copy ──────────────────────────────────────────────────
+    # Fetch whale signal once — shared by both whale slots
+    whale_signal = None
     if CFG["ENABLE_WHALE_COPY"]:
         log.info("Checking whale wallets...")
         whale_signal = get_whale_signal(markets)
 
-        if whale_signal and whale_signal["market"]["id"] not in traded_this_scan:
-            signals_found += 1
-            m      = whale_signal["market"]
-            tags   = ["whale-copy"]
-            dir_   = whale_signal["direction"]
-            price  = whale_signal["price"]
-            otype  = "taker"  # whale copy needs immediate execution
+    if mode == "shadow":
+        # ── Shadow mode: evaluate all 3 strategies, log hypothetical trades ──
+        # No budget is spent. Use results to compare strategies over time.
+        if CFG["ENABLE_HAIKU"]:
+            _, s, t = _run_haiku_slot(con, budget, markets, traded_this_scan, shadow=True)
+            signals_found += s; trades_placed += t
 
-            # Optionally confirm with Haiku before copying
-            skip_trade = False
-            if CFG["ENABLE_HAIKU"]:
-                log.info("Confirming whale signal with Haiku...")
-                analysis = haiku_analyse(m)
-                if analysis and analysis.get("edge") and analysis.get("confidence", 0) >= CFG["HAIKU_MIN_CONF"]:
-                    tags  = ["whale+haiku"]
-                    otype = analysis.get("order_type", "taker")
-                elif analysis and not analysis.get("edge"):
-                    log.info("Haiku rejected whale signal — skipping trade")
-                    skip_trade = True
-                    analysis = None
-                else:
-                    analysis = None  # haiku inconclusive — proceed as pure whale copy
-            else:
-                analysis = None
+        if CFG["ENABLE_WHALE_COPY"]:
+            _, s, t = _run_whale_slot(con, budget, whale_signal, traded_this_scan,
+                                      confirm_with_haiku=False, shadow=True)
+            signals_found += s; trades_placed += t
 
-            notes = whale_signal["notes"]
-            if analysis:
-                notes += f" | Haiku conf={analysis.get('confidence'):.2f}: {analysis.get('reasoning','')}"
+        if CFG["ENABLE_WHALE_COPY"] and CFG["ENABLE_HAIKU"]:
+            _, s, t = _run_whale_slot(con, budget, whale_signal, set(),
+                                      confirm_with_haiku=True, shadow=True)
+            signals_found += s; trades_placed += t
 
-            if skip_trade:
-                new_budget = None
-            else:
-                new_budget = place_paper_trade(con, budget, m, dir_, price, otype, tags, notes)
-            if new_budget is not None:
-                budget = new_budget
-                trades_placed += 1
-                traded_this_scan.add(m["id"])
+    elif mode == "parallel":
+        # ── Parallel mode: each strategy places real trades independently ─────
+        if CFG["ENABLE_HAIKU"]:
+            budget, s, t = _run_haiku_slot(con, budget, markets, traded_this_scan)
+            signals_found += s; trades_placed += t
 
-    # ── Strategy: Haiku standalone ────────────────────────────────────────────
-    if CFG["ENABLE_HAIKU"] and trades_placed < 3:
-        log.info(f"Running Haiku analysis on top {min(10, len(markets))} markets...")
-        for m in markets[:10]:
-            if m["id"] in traded_this_scan:
-                continue
-            if open_trade_count(con) >= CFG["MAX_OPEN_TRADES"]:
-                break
+        if CFG["ENABLE_WHALE_COPY"]:
+            budget, s, t = _run_whale_slot(con, budget, whale_signal, traded_this_scan,
+                                           confirm_with_haiku=False)
+            signals_found += s; trades_placed += t
 
-            analysis = haiku_analyse(m)
-            time.sleep(0.5)  # rate limit
+        if CFG["ENABLE_WHALE_COPY"] and CFG["ENABLE_HAIKU"]:
+            budget, s, t = _run_whale_slot(con, budget, whale_signal, set(),
+                                           confirm_with_haiku=True)
+            signals_found += s; trades_placed += t
 
-            if not analysis:
-                continue
-            if not analysis.get("edge"):
-                continue
-            if analysis.get("confidence", 0) < CFG["HAIKU_MIN_CONF"]:
-                continue
-
-            signals_found += 1
-            dir_   = analysis.get("direction", "yes")
-            price  = m["yes_price"] if dir_ == "yes" else m["no_price"]
-            otype  = analysis.get("order_type", "maker")
-            notes  = analysis.get("reasoning", "")
-
-            new_budget = place_paper_trade(
-                con, budget, m, dir_, price, otype,
-                tags=["haiku-analyse"],
-                notes=notes,
+    else:
+        # ── Compete mode (default): strategies share 3 trade slots ────────────
+        if CFG["ENABLE_WHALE_COPY"] and whale_signal:
+            budget, s, t = _run_whale_slot(
+                con, budget, whale_signal, traded_this_scan,
+                confirm_with_haiku=CFG["ENABLE_HAIKU"],
             )
-            if new_budget is not None:
-                budget = new_budget
-                trades_placed += 1
-                traded_this_scan.add(m["id"])
+            signals_found += s; trades_placed += t
 
-            if trades_placed >= 3:  # cap new trades per scan
-                break
+        if CFG["ENABLE_HAIKU"] and trades_placed < 3:
+            budget, s, t = _run_haiku_slot(con, budget, markets, traded_this_scan)
+            signals_found += s; trades_placed += t
 
-    # Log scan summary
     con.execute(
         "INSERT INTO scan_log (ts, markets_checked, signals_found, trades_placed) VALUES (?,?,?,?)",
         (datetime.now(timezone.utc).isoformat(), len(markets), signals_found, trades_placed),
@@ -814,7 +959,7 @@ def main():
     try:
         budget = load_budget()
         log.info(f"Starting budget: ${budget:.2f} USDC")
-        log.info(f"Strategies: haiku={CFG['ENABLE_HAIKU']}, whale_copy={CFG['ENABLE_WHALE_COPY']}")
+        log.info(f"Strategies: haiku={CFG['ENABLE_HAIKU']}, whale_copy={CFG['ENABLE_WHALE_COPY']}, mode={CFG['STRATEGY_MODE']}")
         log.info(f"Scan interval: {CFG['SCAN_INTERVAL']}s  |  Max open trades: {CFG['MAX_OPEN_TRADES']}")
         log.info(f"Trade size: {CFG['TRADE_SIZE_PCT']*100:.0f}% of budget per trade (~${budget*CFG['TRADE_SIZE_PCT']:.2f})")
 

@@ -9,3 +9,6 @@ paper_trades.db
 # Python cache files
 __pycache__/
 *.pyc
+
+# Claude files
+.claude/settings.local.json
