@@ -19,6 +19,8 @@ All trades are paper-only. No real money moves.
 """
 
 import os, json, re, time, sqlite3, logging, sys, traceback
+from dotenv import load_dotenv
+load_dotenv()
 from datetime import datetime, timezone
 from typing import Optional
 import requests

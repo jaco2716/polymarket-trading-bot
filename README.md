@@ -10,16 +10,24 @@ Automated paper trading bot for [Polymarket](https://polymarket.com). Scans pred
 ## Installation
 
 ```bash
-pip install anthropic requests
+python3 -m pip install anthropic requests python-dotenv
 ```
 
 ## Setup
 
-Set your Anthropic API key as an environment variable:
+Copy the template and fill in your values:
 
 ```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
+cp .env.example .env
 ```
+
+At minimum, set your API key in `.env`:
+
+```
+ANTHROPIC_API_KEY="sk-ant-..."
+```
+
+All other values are optional — the defaults from `.env.example` will be used if omitted. The `.env` file is already in `.gitignore` so your key won't be committed.
 
 Then run:
 
