@@ -18,7 +18,7 @@ Setup:
 All trades are paper-only. No real money moves.
 """
 
-import os, json, time, sqlite3, logging, sys, traceback
+import os, json, re, time, sqlite3, logging, sys, traceback
 from datetime import datetime, timezone
 from typing import Optional
 import requests
@@ -60,7 +60,7 @@ CFG = {
 
     # Limits
     "MAX_OPEN_TRADES":    int(os.getenv("MAX_OPEN_TRADES", "10")),
-    "SCAN_INTERVAL":      int(os.getenv("SCAN_INTERVAL",   "300")),      # seconds between scans
+    "SCAN_INTERVAL":      int(os.getenv("SCAN_INTERVAL",   "3600")),     # seconds between scans
 
     # Whale wallet addresses to track (comma-separated env var or add below)
     "WHALE_WALLETS": [
@@ -117,13 +117,15 @@ def init_db():
 # ── Budget ────────────────────────────────────────────────────────────────────
 def load_budget() -> float:
     if os.path.exists(BUDGET_FILE):
-        return json.load(open(BUDGET_FILE))["budget"]
+        with open(BUDGET_FILE) as f:
+            return json.load(f)["budget"]
     b = CFG["STARTING_BUDGET"]
     save_budget(b)
     return b
 
 def save_budget(b: float):
-    json.dump({"budget": round(b, 4)}, open(BUDGET_FILE, "w"))
+    with open(BUDGET_FILE, "w") as f:
+        json.dump({"budget": round(b, 4)}, f)
 
 def open_trade_count(con) -> int:
     return con.execute("SELECT COUNT(*) FROM trades WHERE resolved=0").fetchone()[0]
@@ -255,13 +257,20 @@ def fetch_whale_recent_trades(wallet: str, lookback_min: int = 30) -> list[dict]
 
     return recent
 
+_WALLET_RE = re.compile(r'^0x[0-9a-fA-F]{40}$')
+
 def fetch_leaderboard_whales(top_n: int = 10) -> list[str]:
     """Discover top profitable wallets from the leaderboard."""
     data = get(f"{DATA_URL}/leaderboard", params={"limit": top_n})
     if not data:
         return []
     entries = data if isinstance(data, list) else data.get("data", [])
-    return [e.get("address") or e.get("user", "") for e in entries if e.get("address") or e.get("user")]
+    wallets = []
+    for e in entries:
+        addr = e.get("address") or e.get("user", "")
+        if addr and _WALLET_RE.match(addr):
+            wallets.append(addr)
+    return wallets
 
 def get_whale_signal(markets: list[dict]) -> Optional[dict]:
     """
@@ -348,7 +357,7 @@ def haiku_analyse(market: dict) -> Optional[dict]:
 
     try:
         resp = client.messages.create(
-            model="claude-haiku-4-5",
+            model="claude-haiku-4-5-20251001",
             max_tokens=200,
             system=HAIKU_SYSTEM,
             messages=[{"role": "user", "content": prompt}],
@@ -422,7 +431,7 @@ def place_paper_trade(
     con.commit()
     save_budget(new_budget)
 
-    gross_if_win = amount * (1 - price)
+    gross_if_win = amount * (1 - price) / price
     log.info(
         f"📝 Paper trade logged:\n"
         f"   Market:  {market['name'][:60]}\n"
@@ -472,7 +481,7 @@ def resolve_settled_trades(con) -> float:
             continue  # resolved but outcome unclear yet
 
         won = (direction == winner)
-        gross = amount * (1 - price) if won else -amount * price
+        gross = amount * (1 - price) / price if won else -amount
         pnl = gross - fee
 
         con.execute("""
@@ -483,7 +492,6 @@ def resolve_settled_trades(con) -> float:
         con.commit()
 
         budget += amount + pnl
-        save_budget(budget)
         total_pnl += pnl
 
         status = "✅ WON" if won else "❌ LOST"
@@ -493,6 +501,8 @@ def resolve_settled_trades(con) -> float:
         )
         time.sleep(0.3)
 
+    if total_pnl != 0.0:
+        save_budget(budget)
     return total_pnl
 
 # ── Stats printer ─────────────────────────────────────────────────────────────
@@ -578,6 +588,7 @@ def run_scan(con):
             otype  = "taker"  # whale copy needs immediate execution
 
             # Optionally confirm with Haiku before copying
+            skip_trade = False
             if CFG["ENABLE_HAIKU"]:
                 log.info("Confirming whale signal with Haiku...")
                 analysis = haiku_analyse(m)
@@ -586,9 +597,10 @@ def run_scan(con):
                     otype = analysis.get("order_type", "taker")
                 elif analysis and not analysis.get("edge"):
                     log.info("Haiku rejected whale signal — skipping trade")
+                    skip_trade = True
                     analysis = None
                 else:
-                    analysis = None  # treat as pure whale copy
+                    analysis = None  # haiku inconclusive — proceed as pure whale copy
             else:
                 analysis = None
 
@@ -596,7 +608,10 @@ def run_scan(con):
             if analysis:
                 notes += f" | Haiku conf={analysis.get('confidence'):.2f}: {analysis.get('reasoning','')}"
 
-            new_budget = place_paper_trade(con, budget, m, dir_, price, otype, tags, notes)
+            if skip_trade:
+                new_budget = None
+            else:
+                new_budget = place_paper_trade(con, budget, m, dir_, price, otype, tags, notes)
             if new_budget is not None:
                 budget = new_budget
                 trades_placed += 1
@@ -660,28 +675,31 @@ def main():
         sys.exit(1)
 
     con = init_db()
-    budget = load_budget()
-    log.info(f"Starting budget: ${budget:.2f} USDC")
-    log.info(f"Strategies: haiku={CFG['ENABLE_HAIKU']}, whale_copy={CFG['ENABLE_WHALE_COPY']}")
-    log.info(f"Scan interval: {CFG['SCAN_INTERVAL']}s  |  Max open trades: {CFG['MAX_OPEN_TRADES']}")
-    log.info(f"Trade size: {CFG['TRADE_SIZE_PCT']*100:.0f}% of budget per trade (~${budget*CFG['TRADE_SIZE_PCT']:.2f})")
+    try:
+        budget = load_budget()
+        log.info(f"Starting budget: ${budget:.2f} USDC")
+        log.info(f"Strategies: haiku={CFG['ENABLE_HAIKU']}, whale_copy={CFG['ENABLE_WHALE_COPY']}")
+        log.info(f"Scan interval: {CFG['SCAN_INTERVAL']}s  |  Max open trades: {CFG['MAX_OPEN_TRADES']}")
+        log.info(f"Trade size: {CFG['TRADE_SIZE_PCT']*100:.0f}% of budget per trade (~${budget*CFG['TRADE_SIZE_PCT']:.2f})")
 
-    scan_count = 0
-    while True:
-        try:
-            run_scan(con)
-            scan_count += 1
-            if scan_count % 12 == 0:  # print stats every ~hour
+        scan_count = 0
+        while True:
+            try:
+                run_scan(con)
+                scan_count += 1
+                if scan_count % 12 == 0:  # print stats every ~hour
+                    print_stats(con)
+            except KeyboardInterrupt:
+                log.info("Stopped by user.")
                 print_stats(con)
-        except KeyboardInterrupt:
-            log.info("Stopped by user.")
-            print_stats(con)
-            break
-        except Exception:
-            log.error(f"Scan error:\n{traceback.format_exc()}")
+                break
+            except Exception:
+                log.error(f"Scan error:\n{traceback.format_exc()}")
 
-        log.info(f"Sleeping {CFG['SCAN_INTERVAL']}s until next scan...")
-        time.sleep(CFG["SCAN_INTERVAL"])
+            log.info(f"Sleeping {CFG['SCAN_INTERVAL']}s until next scan...")
+            time.sleep(CFG["SCAN_INTERVAL"])
+    finally:
+        con.close()
 
 
 if __name__ == "__main__":
