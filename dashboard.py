@@ -51,12 +51,12 @@ def index():
 def overview():
     row = db_one("""
         SELECT
-            COUNT(*)                                        AS total_trades,
-            SUM(CASE WHEN resolved=0 THEN 1 ELSE 0 END)    AS open_trades,
-            SUM(CASE WHEN resolved=1 THEN 1 ELSE 0 END)    AS resolved_trades,
-            SUM(CASE WHEN pnl > 0   THEN 1 ELSE 0 END)     AS wins,
-            ROUND(SUM(COALESCE(pnl, 0)), 2)                 AS total_pnl,
-            ROUND(SUM(COALESCE(fee, 0)), 4)                 AS total_fees
+            COUNT(*)                                                    AS total_trades,
+            COALESCE(SUM(CASE WHEN resolved=0 THEN 1 ELSE 0 END), 0)   AS open_trades,
+            COALESCE(SUM(CASE WHEN resolved=1 THEN 1 ELSE 0 END), 0)   AS resolved_trades,
+            COALESCE(SUM(CASE WHEN pnl > 0   THEN 1 ELSE 0 END), 0)   AS wins,
+            COALESCE(ROUND(SUM(COALESCE(pnl, 0)), 2), 0)               AS total_pnl,
+            COALESCE(ROUND(SUM(COALESCE(fee, 0)), 4), 0)               AS total_fees
         FROM trades
     """)
     resolved = row.get("resolved_trades") or 0
@@ -133,6 +133,15 @@ def trades():
         SELECT id, ts, market_name, direction, price, amount, fee,
                order_type, tags, resolved, outcome, pnl, close_ts
         FROM trades ORDER BY id DESC LIMIT 200
+    """))
+
+
+@app.route("/api/shadow-trades")
+def shadow_trades():
+    return jsonify(db_query("""
+        SELECT id, ts, strategy, market_name, direction, price, amount,
+               resolved, outcome, pnl, close_ts
+        FROM shadow_trades ORDER BY id DESC LIMIT 200
     """))
 
 

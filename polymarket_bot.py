@@ -58,7 +58,8 @@ CFG = {
     # Strategies
     "ENABLE_HAIKU":       os.getenv("ENABLE_HAIKU",       "true").lower() == "true",
     "ENABLE_WHALE_COPY":  os.getenv("ENABLE_WHALE_COPY",  "true").lower() == "true",
-    "HAIKU_MIN_CONF":     float(os.getenv("HAIKU_MIN_CONF",   "0.65")),  # confidence threshold
+    "HAIKU_MIN_CONF":        float(os.getenv("HAIKU_MIN_CONF",        "0.65")),  # confidence threshold for real trades
+    "SHADOW_HAIKU_MIN_CONF": float(os.getenv("SHADOW_HAIKU_MIN_CONF", "0.35")),  # lower threshold for shadow data collection
     "WHALE_MIN_SIZE":     float(os.getenv("WHALE_MIN_SIZE",   "500")),   # min USD for whale trade
     "WHALE_LOOKBACK_MIN": int(os.getenv("WHALE_LOOKBACK_MIN", "30")),    # minutes to look back
 
@@ -69,7 +70,13 @@ CFG = {
     # Strategy mode
     # "compete"  — strategies share 3 trade slots per scan (default)
     # "parallel" — each strategy gets its own slot; use this to A/B test
+    # "shadow"   — no real trades; logs hypothetical outcomes for all 3 strategies
     "STRATEGY_MODE":      os.getenv("STRATEGY_MODE", "compete"),
+
+    # Shadow scan interval (seconds) — only used in shadow mode.
+    # Set lower than SCAN_INTERVAL to collect training data faster.
+    # Cost scales linearly: 15min ≈ $12/mo, 10min ≈ $18/mo, 5min ≈ $36/mo
+    "SHADOW_SCAN_INTERVAL": int(os.getenv("SHADOW_SCAN_INTERVAL", os.getenv("SCAN_INTERVAL", "3600"))),
 
     # Whale wallet addresses to track (comma-separated env var or add below)
     "WHALE_WALLETS": [
@@ -130,12 +137,18 @@ def init_db():
             direction   TEXT    NOT NULL,
             price       REAL    NOT NULL,
             amount      REAL    NOT NULL,   -- hypothetical stake (no real budget impact)
+            confidence  REAL,               -- haiku confidence score (NULL for whale-copy)
             resolved    INTEGER DEFAULT 0,
             outcome     TEXT,
             pnl         REAL,
             close_ts    TEXT
         )
     """)
+    # Migrate existing shadow_trades table if confidence column is missing
+    try:
+        con.execute("ALTER TABLE shadow_trades ADD COLUMN confidence REAL")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     con.commit()
     return con
 
@@ -663,13 +676,14 @@ def resolve_settled_trades(con) -> float:
     return total_pnl
 
 # ── Shadow trade engine ───────────────────────────────────────────────────────
-def log_shadow_trade(con, strategy: str, market: dict, direction: str, price: float):
+def log_shadow_trade(con, strategy: str, market: dict, direction: str, price: float,
+                     confidence: Optional[float] = None):
     """Record a hypothetical trade with no budget impact."""
     amount = round(CFG["STARTING_BUDGET"] * CFG["TRADE_SIZE_PCT"], 2)
     con.execute("""
         INSERT INTO shadow_trades
-            (ts, strategy, market_id, market_name, direction, price, amount)
-        VALUES (?,?,?,?,?,?,?)
+            (ts, strategy, market_id, market_name, direction, price, amount, confidence)
+        VALUES (?,?,?,?,?,?,?,?)
     """, (
         datetime.now(timezone.utc).isoformat(),
         strategy,
@@ -678,10 +692,12 @@ def log_shadow_trade(con, strategy: str, market: dict, direction: str, price: fl
         direction,
         price,
         amount,
+        confidence,
     ))
     con.commit()
+    conf_str = f" conf={confidence:.2f}" if confidence is not None else ""
     log.info(
-        f"👻 Shadow [{strategy}]: {direction.upper()} on '{market['name'][:55]}' @ {price:.3f}"
+        f"👻 Shadow [{strategy}]{conf_str}: {direction.upper()} on '{market['name'][:55]}' @ {price:.3f}"
     )
 
 def resolve_shadow_trades(con):
@@ -798,13 +814,15 @@ def _run_haiku_slot(con, budget: float, markets: list[dict], traded: set,
         time.sleep(0.5)
         if not analysis or not analysis.get("edge"):
             continue
-        if analysis.get("confidence", 0) < CFG["HAIKU_MIN_CONF"]:
+        conf      = analysis.get("confidence", 0)
+        min_conf  = CFG["SHADOW_HAIKU_MIN_CONF"] if shadow else CFG["HAIKU_MIN_CONF"]
+        if conf < min_conf:
             continue
         signals += 1
         dir_  = analysis.get("direction", "yes")
         price = m["yes_price"] if dir_ == "yes" else m["no_price"]
         if shadow:
-            log_shadow_trade(con, "haiku-analyse", m, dir_, price)
+            log_shadow_trade(con, "haiku-analyse", m, dir_, price, confidence=conf)
         else:
             otype = analysis.get("order_type", "maker")
             new_budget = place_paper_trade(
@@ -852,7 +870,8 @@ def _run_whale_slot(con, budget: float, whale_signal: Optional[dict], traded: se
         log.info("[whale-copy] Copying whale signal directly...")
 
     if shadow:
-        log_shadow_trade(con, tags[0], m, dir_, price)
+        conf = analysis.get("confidence") if confirm_with_haiku and analysis else None
+        log_shadow_trade(con, tags[0], m, dir_, price, confidence=conf)
         traded.add(m["id"])
         return budget, 1, 1
 
@@ -977,8 +996,9 @@ def main():
             except Exception:
                 log.error(f"Scan error:\n{traceback.format_exc()}")
 
-            log.info(f"Sleeping {CFG['SCAN_INTERVAL']}s until next scan...")
-            time.sleep(CFG["SCAN_INTERVAL"])
+            interval = CFG["SHADOW_SCAN_INTERVAL"] if CFG["STRATEGY_MODE"] == "shadow" else CFG["SCAN_INTERVAL"]
+            log.info(f"Sleeping {interval}s until next scan...")
+            time.sleep(interval)
     finally:
         con.close()
 

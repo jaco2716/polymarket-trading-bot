@@ -88,6 +88,15 @@
           <button onclick="setFilter('all')"      id="f-all"      class="text-xs px-3 py-1 rounded filter-on">All</button>
           <button onclick="setFilter('open')"     id="f-open"     class="text-xs px-3 py-1 rounded filter-off">Open</button>
           <button onclick="setFilter('resolved')" id="f-resolved" class="text-xs px-3 py-1 rounded filter-off">Resolved</button>
+          <button onclick="setFilter('shadow')"   id="f-shadow"   class="text-xs px-3 py-1 rounded filter-off">Shadow</button>
+        </div>
+        <div id="conf-filters" class="hidden flex gap-1.5">
+          <span class="text-xs muted self-center">Conf:</span>
+          <button onclick="setConfFilter('all')"       id="cf-all"       class="text-xs px-2 py-1 rounded filter-on">All</button>
+          <button onclick="setConfFilter('0.35-0.45')" id="cf-0.35-0.45" class="text-xs px-2 py-1 rounded filter-off">0.35–0.45</button>
+          <button onclick="setConfFilter('0.45-0.55')" id="cf-0.45-0.55" class="text-xs px-2 py-1 rounded filter-off">0.45–0.55</button>
+          <button onclick="setConfFilter('0.55-0.65')" id="cf-0.55-0.65" class="text-xs px-2 py-1 rounded filter-off">0.55–0.65</button>
+          <button onclick="setConfFilter('0.65+')"     id="cf-0.65+"     class="text-xs px-2 py-1 rounded filter-off">0.65+</button>
         </div>
       </div>
       <div class="overflow-x-auto">
@@ -100,6 +109,7 @@
               <th class="px-3 py-2 text-right">Price</th>
               <th class="px-3 py-2 text-right">Staked</th>
               <th class="px-3 py-2 text-left">Strategy</th>
+              <th class="px-3 py-2 text-center hidden" id="conf-col-header">Conf</th>
               <th class="px-3 py-2 text-center">Status</th>
               <th class="px-3 py-2 text-right">P&amp;L</th>
               <th class="px-3 py-2 text-left">Date</th>
@@ -136,8 +146,10 @@
   </main>
 
 <script>
-let allTrades   = [];
-let tradeFilter = 'all';
+let allTrades    = [];
+let shadowTrades = [];
+let tradeFilter  = 'all';
+let confFilter   = 'all';
 let pnlChart    = null;
 let countdown   = 60;
 let countdownTimer;
@@ -314,32 +326,102 @@ function renderPnlChart(points) {
 // ── Trades table ──────────────────────────────────────────
 function setFilter(f) {
   tradeFilter = f;
-  ['all', 'open', 'resolved'].forEach(id => {
+  ['all', 'open', 'resolved', 'shadow'].forEach(id => {
     document.getElementById(`f-${id}`).className =
       `text-xs px-3 py-1 rounded ${f === id ? 'filter-on' : 'filter-off'}`;
+  });
+  // Show/hide confidence filters and column header
+  document.getElementById('conf-filters').classList.toggle('hidden', f !== 'shadow');
+  document.getElementById('conf-col-header').classList.toggle('hidden', f !== 'shadow');
+  renderTradesTable();
+}
+
+function setConfFilter(f) {
+  confFilter = f;
+  ['all', '0.35-0.45', '0.45-0.55', '0.55-0.65', '0.65+'].forEach(id => {
+    document.getElementById(`cf-${id}`).className =
+      `text-xs px-2 py-1 rounded ${f === id ? 'filter-on' : 'filter-off'}`;
   });
   renderTradesTable();
 }
 
+function inConfBucket(conf, bucket) {
+  if (bucket === 'all' || conf == null) return true;
+  if (bucket === '0.35-0.45') return conf >= 0.35 && conf < 0.45;
+  if (bucket === '0.45-0.55') return conf >= 0.45 && conf < 0.55;
+  if (bucket === '0.55-0.65') return conf >= 0.55 && conf < 0.65;
+  if (bucket === '0.65+')     return conf >= 0.65;
+  return true;
+}
+
 function renderTradesTable() {
+  const tbody = document.getElementById('trades-tbody');
+  const empty = document.getElementById('trades-empty');
+
+  // Shadow trades have a different shape — render separately
+  if (tradeFilter === 'shadow') {
+    const filtered = shadowTrades.filter(t => inConfBucket(t.confidence, confFilter));
+    if (shadowTrades.length === 0) {
+      tbody.innerHTML = '';
+      empty.textContent = 'No shadow trades yet. Set STRATEGY_MODE=shadow in .env to collect data.';
+      empty.classList.remove('hidden');
+      return;
+    }
+    if (filtered.length === 0) {
+      tbody.innerHTML = '';
+      empty.textContent = 'No shadow trades in this confidence range.';
+      empty.classList.remove('hidden');
+      return;
+    }
+    empty.classList.add('hidden');
+    tbody.innerHTML = filtered.map(t => {
+      const dirBadge = `<span class="badge ${t.direction === 'yes' ? 'badge-yes' : 'badge-no'}">${t.direction.toUpperCase()}</span>`;
+      const confHtml = t.confidence != null
+        ? `<span class="${t.confidence >= 0.65 ? 'pos' : t.confidence >= 0.50 ? 'text-yellow-400' : 'muted'}">${(t.confidence * 100).toFixed(0)}%</span>`
+        : `<span class="muted">—</span>`;
+      let statusHtml;
+      if (!t.resolved) {
+        statusHtml = `<span class="badge badge-open">PENDING</span>`;
+      } else if (t.outcome === t.direction) {
+        statusHtml = `<span class="badge badge-won">WOULD WIN</span>`;
+      } else {
+        statusHtml = `<span class="badge badge-lost">WOULD LOSE</span>`;
+      }
+      return `
+        <tr class="row" style="border-top:1px solid #21262d">
+          <td class="px-3 py-2 muted">${t.id}</td>
+          <td class="px-3 py-2" style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${t.market_name}">${t.market_name}</td>
+          <td class="px-3 py-2 text-center">${dirBadge}</td>
+          <td class="px-3 py-2 text-right muted">${(t.price * 100).toFixed(1)}%</td>
+          <td class="px-3 py-2 text-right muted">$${t.amount.toFixed(2)}</td>
+          <td class="px-3 py-2 muted">${t.strategy}</td>
+          <td class="px-3 py-2 text-center">${confHtml}</td>
+          <td class="px-3 py-2 text-center">${statusHtml}</td>
+          <td class="px-3 py-2 text-right font-medium">${pnlSpan(t.pnl)}</td>
+          <td class="px-3 py-2 muted">${fmtDate(t.ts)}</td>
+        </tr>
+      `;
+    }).join('');
+    return;
+  }
+
+  // Real trades
   const list = allTrades.filter(t => {
     if (tradeFilter === 'open')     return !t.resolved;
     if (tradeFilter === 'resolved') return  t.resolved;
     return true;
   });
 
-  const tbody = document.getElementById('trades-tbody');
-  const empty = document.getElementById('trades-empty');
-
   if (list.length === 0) {
     tbody.innerHTML = '';
+    empty.textContent = 'No trades yet';
     empty.classList.remove('hidden');
     return;
   }
   empty.classList.add('hidden');
 
   tbody.innerHTML = list.map(t => {
-    const tag     = (JSON.parse(t.tags || '[]')[0]) || '—';
+    const tag      = (JSON.parse(t.tags || '[]')[0]) || '—';
     const dirBadge = `<span class="badge ${t.direction === 'yes' ? 'badge-yes' : 'badge-no'}">${t.direction.toUpperCase()}</span>`;
     let statusHtml;
     if (!t.resolved) {
@@ -388,16 +470,18 @@ function renderScanLog(scans) {
 // ── Fetch & render all ────────────────────────────────────
 async function refresh() {
   try {
-    const [ov, strat, trades, pnl, scans] = await Promise.all([
+    const [ov, strat, trades, shadow, pnl, scans] = await Promise.all([
       fetch('/api/overview').then(r => r.json()),
       fetch('/api/strategy-stats').then(r => r.json()),
       fetch('/api/trades').then(r => r.json()),
+      fetch('/api/shadow-trades').then(r => r.json()),
       fetch('/api/pnl-history').then(r => r.json()),
       fetch('/api/scan-log').then(r => r.json()),
     ]);
     renderStatCards(ov);
     renderStrategyStats(strat);
-    allTrades = trades;
+    allTrades    = trades;
+    shadowTrades = shadow;
     renderTradesTable();
     renderPnlChart(pnl);
     renderScanLog(scans);
