@@ -19,6 +19,8 @@ All trades are paper-only. No real money moves.
 """
 
 import os, json, re, time, sqlite3, logging, sys, traceback
+import urllib.parse
+import xml.etree.ElementTree as ET
 from dotenv import load_dotenv
 load_dotenv()
 from datetime import datetime, timezone
@@ -316,6 +318,35 @@ def get_whale_signal(markets: list[dict]) -> Optional[dict]:
 
     return None
 
+# ── Google News — context for Haiku ──────────────────────────────────────────
+_news_cache: dict[str, tuple[float, list[str]]] = {}
+NEWS_CACHE_TTL = 3600  # seconds
+
+def fetch_news_headlines(query: str, max_items: int = 5) -> list[str]:
+    """Fetch recent headlines from Google News RSS. Cached for 1 hour."""
+    now = time.time()
+    if query in _news_cache:
+        cached_at, headlines = _news_cache[query]
+        if now - cached_at < NEWS_CACHE_TTL:
+            return headlines
+
+    encoded = urllib.parse.quote(query)
+    url = f"https://news.google.com/rss/search?q={encoded}&hl=en-US&gl=US&ceid=US:en"
+    try:
+        r = SESSION.get(url, timeout=8)
+        r.raise_for_status()
+        root = ET.fromstring(r.text)
+        headlines = [
+            item.findtext("title", "")
+            for item in root.findall("./channel/item")[:max_items]
+            if item.findtext("title", "")
+        ]
+        _news_cache[query] = (now, headlines)
+        return headlines
+    except Exception as e:
+        log.debug(f"News fetch failed for '{query[:40]}': {e}")
+        return []
+
 # ── Claude Haiku — edge detection ─────────────────────────────────────────────
 _haiku_client: Optional[anthropic.Anthropic] = None
 
@@ -346,15 +377,21 @@ def haiku_analyse(market: dict) -> Optional[dict]:
     """Ask Claude Haiku if a market has a tradeable edge."""
     client = get_haiku_client()
 
+    headlines = fetch_news_headlines(market["name"])
+    news_section = ""
+    if headlines:
+        news_section = "\nRecent news:\n" + "\n".join(f"- {h}" for h in headlines) + "\n"
+
     prompt = (
         f"Market: {market['name']}\n"
         f"Current YES price: {market['yes_price']:.3f} ({market['yes_price']*100:.1f}%)\n"
         f"Current NO price:  {market['no_price']:.3f} ({market['no_price']*100:.1f}%)\n"
         f"24h volume: ${market['volume_24h']:,.0f}\n"
         f"Liquidity:  ${market['liquidity']:,.0f}\n"
-        f"Category tags: {', '.join(str(t) for t in market.get('tags', []))}\n\n"
-        "Is there a positive edge here? Consider: is this market likely mispriced based on "
-        "the name and odds alone? If you have no strong signal, say edge:false."
+        f"Category tags: {', '.join(str(t) for t in market.get('tags', []))}\n"
+        f"{news_section}\n"
+        "Is there a positive edge here? Consider: does the news suggest the market is "
+        "mispriced? If you have no strong signal, say edge:false."
     )
 
     try:

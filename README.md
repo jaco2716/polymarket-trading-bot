@@ -13,6 +13,8 @@ Automated paper trading bot for [Polymarket](https://polymarket.com). Scans pred
 python3 -m pip install anthropic requests python-dotenv
 ```
 
+> If you see `ModuleNotFoundError: No module named 'dotenv'`, run the install command above again — `python-dotenv` may not have been included in your initial install.
+
 ## Setup
 
 Copy the template and fill in your values:
