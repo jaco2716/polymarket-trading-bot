@@ -18,7 +18,7 @@ Setup:
 All trades are paper-only. No real money moves.
 """
 
-import os, json, re, time, sqlite3, logging, sys, traceback
+import os, json, re, time, sqlite3, logging, sys, traceback, random
 import urllib.parse
 import xml.etree.ElementTree as ET
 from dotenv import load_dotenv
@@ -199,12 +199,16 @@ def get(url: str, params: dict = None, timeout: int = 10) -> Optional[dict]:
         return None
 
 # ── Gamma API — market discovery ──────────────────────────────────────────────
-def fetch_markets() -> list[dict]:
-    """Fetch active, liquid binary markets sorted by volume."""
+def fetch_markets(randomize: bool = False) -> list[dict]:
+    """Fetch active, liquid binary markets sorted by volume.
+    In shadow mode (randomize=True) pulls a larger pool and shuffles it
+    so each scan evaluates a different cross-section of markets.
+    """
+    pool_size = CFG["MARKETS_PER_SCAN"] * 6 if randomize else CFG["MARKETS_PER_SCAN"] * 3
     data = get(f"{GAMMA_URL}/markets", params={
         "active": "true",
         "closed": "false",
-        "limit":  CFG["MARKETS_PER_SCAN"] * 3,  # fetch extra, then filter
+        "limit":  pool_size,
         "order":  "volume24hr",
         "ascending": "false",
     })
@@ -254,11 +258,15 @@ def fetch_markets() -> list[dict]:
                 "tags":       m.get("tags") or [],
             })
 
-            if len(result) >= CFG["MARKETS_PER_SCAN"]:
+            if len(result) >= (CFG["MARKETS_PER_SCAN"] * 2 if randomize else CFG["MARKETS_PER_SCAN"]):
                 break
 
         except (TypeError, ValueError, KeyError):
             continue
+
+    if randomize and len(result) > CFG["MARKETS_PER_SCAN"]:
+        random.shuffle(result)
+        result = result[:CFG["MARKETS_PER_SCAN"]]
 
     log.info(f"Fetched {len(result)} qualifying markets")
     return result
@@ -314,14 +322,18 @@ def fetch_profitable_wallet_set(top_n: int = 30) -> set[str]:
     if now - cached_at < LEADERBOARD_CACHE_TTL and cached_set:
         return cached_set
 
-    data = get(f"{DATA_URL}/leaderboard", params={"limit": top_n})
+    data = get(f"{DATA_URL}/v1/leaderboard", params={
+        "limit": top_n,
+        "timePeriod": "ALL",
+        "orderBy": "PNL",
+    })
     if not data:
         return cached_set  # return stale cache on failure rather than empty
 
     entries = data if isinstance(data, list) else data.get("data", [])
     wallets = set()
     for e in entries:
-        addr = e.get("address") or e.get("user", "")
+        addr = e.get("proxyWallet") or e.get("address") or e.get("user", "")
         if addr and _WALLET_RE.match(addr):
             wallets.add(addr)
 
@@ -424,34 +436,50 @@ def get_whale_signal(markets: list[dict]) -> Optional[dict]:
     log.info(f"Scanning global trade feed for activity from {len(profitable)} profitable wallets...")
     recent_trades = fetch_global_recent_trades(CFG["WHALE_MIN_SIZE"], CFG["WHALE_LOOKBACK_MIN"])
 
-    if not recent_trades:
-        log.info("Global trade feed returned no results — skipping whale strategy")
+    if recent_trades:
+        log.info(f"Global feed: {len(recent_trades)} large trades in last {CFG['WHALE_LOOKBACK_MIN']}min")
+        for trade in recent_trades:
+            if trade["wallet"] not in profitable:
+                continue  # active but not proven profitable — skip
+            if trade["market_id"] not in market_ids:
+                continue  # not a market we're watching
+            m = market_ids[trade["market_id"]]
+            log.info(
+                f"🐋 Whale signal (active+profitable): {trade['wallet'][:10]}… "
+                f"{trade['direction'].upper()} on '{m['name'][:50]}' ${trade['size']:.0f}"
+            )
+            return {
+                "market":     m,
+                "direction":  trade["direction"],
+                "price":      m["yes_price"] if trade["direction"] == "yes" else m["no_price"],
+                "signal":     "whale-copy",
+                "whale":      trade["wallet"],
+                "whale_size": trade["size"],
+                "notes":      f"Whale {trade['wallet'][:10]}… traded ${trade['size']:.0f}",
+            }
+        log.info("No overlap between active large traders and profitable leaderboard this scan")
         return None
 
-    log.info(f"Global feed: {len(recent_trades)} large trades in last {CFG['WHALE_LOOKBACK_MIN']}min")
-
-    for trade in recent_trades:
-        if trade["wallet"] not in profitable:
-            continue  # active but not proven profitable — skip
-        if trade["market_id"] not in market_ids:
-            continue  # not a market we're watching
-
-        m = market_ids[trade["market_id"]]
-        log.info(
-            f"🐋 Whale signal (active+profitable): {trade['wallet'][:10]}… "
-            f"{trade['direction'].upper()} on '{m['name'][:50]}' ${trade['size']:.0f}"
-        )
-        return {
-            "market":     m,
-            "direction":  trade["direction"],
-            "price":      m["yes_price"] if trade["direction"] == "yes" else m["no_price"],
-            "signal":     "whale-copy",
-            "whale":      trade["wallet"],
-            "whale_size": trade["size"],
-            "notes":      f"Whale {trade['wallet'][:10]}… traded ${trade['size']:.0f}",
-        }
-
-    log.info("No overlap between active large traders and profitable leaderboard this scan")
+    # Global feed unavailable — fall back to polling profitable wallets individually
+    log.info("Global feed unavailable — polling profitable wallets individually (capped at 10)...")
+    for wallet in list(profitable)[:10]:
+        for trade in fetch_whale_recent_trades(wallet, CFG["WHALE_LOOKBACK_MIN"]):
+            if trade["market_id"] in market_ids:
+                m = market_ids[trade["market_id"]]
+                log.info(
+                    f"🐋 Whale signal (fallback): {wallet[:10]}… "
+                    f"{trade['direction'].upper()} on '{m['name'][:50]}' ${trade['size']:.0f}"
+                )
+                return {
+                    "market":     m,
+                    "direction":  trade["direction"],
+                    "price":      m["yes_price"] if trade["direction"] == "yes" else m["no_price"],
+                    "signal":     "whale-copy",
+                    "whale":      wallet,
+                    "whale_size": trade["size"],
+                    "notes":      f"Whale {wallet[:10]}… traded ${trade['size']:.0f} (fallback)",
+                }
+        time.sleep(0.2)
     return None
 
 # ── Google News — context for Haiku ──────────────────────────────────────────
@@ -509,7 +537,23 @@ Lean toward "edge: false" unless you see a clear mispricing.
 Prefer "maker" orders (limit orders) to save on fees.
 Only say edge:true if confidence >= 0.60."""
 
-def haiku_analyse(market: dict) -> Optional[dict]:
+def _haiku_system_shadow() -> str:
+    threshold = CFG["SHADOW_HAIKU_MIN_CONF"]
+    return f"""You are a prediction market analyst collecting training data. Evaluate every market honestly.
+
+Reply ONLY with valid JSON — no prose, no markdown fences:
+{{
+  "edge": true | false,
+  "direction": "yes" | "no",
+  "confidence": 0.0-1.0,
+  "reasoning": "one sentence max",
+  "order_type": "maker" | "taker"
+}}
+
+Be willing to say edge:true whenever confidence >= {threshold} — this is a data collection run, not live trading.
+Prefer "maker" orders (limit orders) to save on fees."""
+
+def haiku_analyse(market: dict, shadow: bool = False) -> Optional[dict]:
     """Ask Claude Haiku if a market has a tradeable edge."""
     client = get_haiku_client()
 
@@ -530,11 +574,13 @@ def haiku_analyse(market: dict) -> Optional[dict]:
         "mispriced? If you have no strong signal, say edge:false."
     )
 
+    system = _haiku_system_shadow() if shadow else HAIKU_SYSTEM
+
     try:
         resp = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=200,
-            system=HAIKU_SYSTEM,
+            system=system,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = resp.content[0].text.strip()
@@ -815,7 +861,7 @@ def _run_haiku_slot(con, budget: float, markets: list[dict], traded: set,
             continue
         if not shadow and open_trade_count(con) >= CFG["MAX_OPEN_TRADES"]:
             break
-        analysis = haiku_analyse(m)
+        analysis = haiku_analyse(m, shadow=shadow)
         time.sleep(0.5)
         if not analysis or not analysis.get("edge"):
             continue
@@ -900,7 +946,7 @@ def run_scan(con):
         log.info("At max open trades — skipping new entries this scan")
         return
 
-    markets = fetch_markets()
+    markets = fetch_markets(randomize=(mode == "shadow"))
     if not markets:
         log.warning("No markets returned — API may be down")
         return
