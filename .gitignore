@@ -1,1 +1,11 @@
+# Ignore environment variables file with sensitive information
 .env
+
+# Bot runtime files
+bot.log
+budget.json
+paper_trades.db
+
+# Python cache files
+__pycache__/
+*.pyc
