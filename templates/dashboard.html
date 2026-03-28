@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Polymarket Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    body { background: #0d1117; color: #e6edf3; font-family: ui-monospace, 'Cascadia Code', monospace; }
+    ::-webkit-scrollbar { width: 5px; height: 5px; }
+    ::-webkit-scrollbar-track { background: #161b22; }
+    ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+    .card { background: #161b22; border: 1px solid #21262d; border-radius: 8px; }
+    .pos  { color: #3fb950; }
+    .neg  { color: #f85149; }
+    .muted { color: #8b949e; }
+    .badge { padding: 1px 8px; border-radius: 9999px; font-size: 10px; font-weight: 600; letter-spacing: .04em; }
+    .badge-yes  { background: rgba(63,185,80,.12);  color: #3fb950; }
+    .badge-no   { background: rgba(248,81,73,.12);  color: #f85149; }
+    .badge-open { background: rgba(88,166,255,.12); color: #58a6ff; }
+    .badge-won  { background: rgba(63,185,80,.12);  color: #3fb950; }
+    .badge-lost { background: rgba(248,81,73,.12);  color: #f85149; }
+    .tab-active   { border-bottom: 2px solid #58a6ff; color: #e6edf3; }
+    .tab-inactive { border-bottom: 2px solid transparent; color: #8b949e; }
+    .tab-inactive:hover { color: #c9d1d9; }
+    .filter-on  { background: #1f6feb; color: #fff; }
+    .filter-off { background: #21262d; color: #8b949e; }
+    .filter-off:hover { background: #30363d; color: #e6edf3; }
+    tr.row:hover { background: rgba(255,255,255,.025); }
+  </style>
+</head>
+<body class="min-h-screen">
+
+  <!-- ── Header ── -->
+  <header style="background:#161b22;border-bottom:1px solid #21262d"
+          class="px-6 py-4 flex items-center justify-between sticky top-0 z-20">
+    <div>
+      <h1 class="text-sm font-bold text-white tracking-wide">POLYMARKET PAPER TRADING</h1>
+      <p class="text-xs muted mt-0.5">Paper money only · No real funds at risk</p>
+    </div>
+    <div class="text-right text-xs muted space-y-0.5">
+      <div id="last-updated">—</div>
+      <div>Refreshes in <span id="countdown-val" class="text-white">60</span>s</div>
+    </div>
+  </header>
+
+  <main class="max-w-6xl mx-auto px-4 py-5 space-y-4">
+
+    <!-- ── Stat cards ── -->
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3" id="stat-cards">
+      <!-- skeleton -->
+      <div class="card px-4 py-4 animate-pulse"><div class="h-3 w-16 bg-gray-700 rounded mb-2"></div><div class="h-6 w-24 bg-gray-600 rounded"></div></div>
+      <div class="card px-4 py-4 animate-pulse"><div class="h-3 w-16 bg-gray-700 rounded mb-2"></div><div class="h-6 w-24 bg-gray-600 rounded"></div></div>
+      <div class="card px-4 py-4 animate-pulse"><div class="h-3 w-16 bg-gray-700 rounded mb-2"></div><div class="h-6 w-24 bg-gray-600 rounded"></div></div>
+      <div class="card px-4 py-4 animate-pulse"><div class="h-3 w-16 bg-gray-700 rounded mb-2"></div><div class="h-6 w-24 bg-gray-600 rounded"></div></div>
+    </div>
+
+    <!-- ── P&L Chart ── -->
+    <div class="card p-4">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="text-xs font-semibold muted uppercase tracking-wider">Cumulative P&amp;L</h2>
+        <span id="pnl-total" class="text-lg font-bold text-white">—</span>
+      </div>
+      <div style="height:160px"><canvas id="pnl-chart"></canvas></div>
+    </div>
+
+    <!-- ── Strategy comparison ── -->
+    <div class="card overflow-hidden">
+      <div style="border-bottom:1px solid #21262d" class="flex items-center justify-between pr-4">
+        <div class="flex">
+          <button id="tab-real-btn" onclick="switchTab('real')"
+            class="px-4 py-3 text-xs font-semibold tab-active">Real Trades</button>
+          <button id="tab-shadow-btn" onclick="switchTab('shadow')"
+            class="px-4 py-3 text-xs font-semibold tab-inactive">Shadow Comparison</button>
+        </div>
+        <span class="text-xs muted hidden" id="shadow-hint">Set STRATEGY_MODE=shadow to collect data</span>
+      </div>
+      <div id="tab-real-content"></div>
+      <div id="tab-shadow-content" class="hidden"></div>
+    </div>
+
+    <!-- ── Trade history ── -->
+    <div class="card overflow-hidden">
+      <div style="border-bottom:1px solid #21262d" class="px-4 py-3 flex items-center justify-between">
+        <h2 class="text-xs font-semibold muted uppercase tracking-wider">Trade History</h2>
+        <div class="flex gap-1.5">
+          <button onclick="setFilter('all')"      id="f-all"      class="text-xs px-3 py-1 rounded filter-on">All</button>
+          <button onclick="setFilter('open')"     id="f-open"     class="text-xs px-3 py-1 rounded filter-off">Open</button>
+          <button onclick="setFilter('resolved')" id="f-resolved" class="text-xs px-3 py-1 rounded filter-off">Resolved</button>
+        </div>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-xs">
+          <thead style="background:#1c2128;color:#8b949e" class="uppercase tracking-wider text-xs">
+            <tr>
+              <th class="px-3 py-2 text-left">#</th>
+              <th class="px-3 py-2 text-left">Market</th>
+              <th class="px-3 py-2 text-center">Dir</th>
+              <th class="px-3 py-2 text-right">Price</th>
+              <th class="px-3 py-2 text-right">Staked</th>
+              <th class="px-3 py-2 text-left">Strategy</th>
+              <th class="px-3 py-2 text-center">Status</th>
+              <th class="px-3 py-2 text-right">P&amp;L</th>
+              <th class="px-3 py-2 text-left">Date</th>
+            </tr>
+          </thead>
+          <tbody id="trades-tbody"></tbody>
+        </table>
+        <div id="trades-empty" class="hidden text-center py-10 muted text-xs">No trades yet</div>
+      </div>
+    </div>
+
+    <!-- ── Scan log ── -->
+    <div class="card overflow-hidden">
+      <div style="border-bottom:1px solid #21262d" class="px-4 py-3">
+        <h2 class="text-xs font-semibold muted uppercase tracking-wider">Recent Scans</h2>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-xs">
+          <thead style="background:#1c2128;color:#8b949e" class="uppercase tracking-wider text-xs">
+            <tr>
+              <th class="px-3 py-2 text-left">Time (UTC)</th>
+              <th class="px-3 py-2 text-right">Markets</th>
+              <th class="px-3 py-2 text-right">Signals</th>
+              <th class="px-3 py-2 text-right">Trades</th>
+            </tr>
+          </thead>
+          <tbody id="scan-tbody"></tbody>
+        </table>
+        <div id="scan-empty" class="hidden text-center py-10 muted text-xs">No scans recorded yet</div>
+      </div>
+    </div>
+
+    <p class="text-center text-xs muted pb-4">Auto-refreshes every 60 seconds · Run <code class="bg-gray-800 px-1 rounded">python3 dashboard.py</code> to keep this open alongside the bot</p>
+  </main>
+
+<script>
+let allTrades   = [];
+let tradeFilter = 'all';
+let pnlChart    = null;
+let countdown   = 60;
+let countdownTimer;
+
+// ── Formatters ────────────────────────────────────────────
+const sign    = n => n >= 0 ? '+' : '';
+const fmtPnl  = n => n == null ? '—' : `${sign(n)}$${Math.abs(n).toFixed(2)}`;
+const fmtDate = ts => ts ? ts.slice(0, 16).replace('T', ' ') : '—';
+const pnlCls  = n => n == null ? 'muted' : n > 0 ? 'pos' : n < 0 ? 'neg' : 'muted';
+const pnlSpan = n => `<span class="${pnlCls(n)}">${fmtPnl(n)}</span>`;
+
+// ── Stat cards ────────────────────────────────────────────
+function renderStatCards(ov) {
+  const starting = 500; // reference point
+  const budgetChange = ov.budget != null ? ov.budget - starting : null;
+
+  const cards = [
+    {
+      label: 'Budget',
+      value: ov.budget != null ? `$${ov.budget.toFixed(2)}` : '—',
+      sub: budgetChange != null ? `${sign(budgetChange)}$${Math.abs(budgetChange).toFixed(2)} from start` : '',
+      subCls: pnlCls(budgetChange),
+    },
+    {
+      label: 'Total P&L',
+      value: fmtPnl(ov.total_pnl),
+      valueCls: pnlCls(ov.total_pnl),
+      sub: `Fees: $${(ov.total_fees || 0).toFixed(4)}`,
+      subCls: 'muted',
+    },
+    {
+      label: 'Win Rate',
+      value: ov.resolved_trades > 0 ? `${ov.win_rate}%` : '—',
+      sub: `${ov.wins}W / ${ov.losses}L  (${ov.resolved_trades} resolved)`,
+      subCls: 'muted',
+    },
+    {
+      label: 'Open Positions',
+      value: ov.open_trades,
+      sub: `${ov.total_trades} total trades`,
+      subCls: 'muted',
+    },
+  ];
+
+  document.getElementById('stat-cards').innerHTML = cards.map(c => `
+    <div class="card px-4 py-4">
+      <div class="text-xs muted mb-1 uppercase tracking-wider">${c.label}</div>
+      <div class="text-2xl font-bold ${c.valueCls || 'text-white'}">${c.value}</div>
+      <div class="text-xs ${c.subCls} mt-1.5">${c.sub}</div>
+    </div>
+  `).join('');
+}
+
+// ── Strategy table ────────────────────────────────────────
+function buildStratTable(rows, shadow) {
+  if (!rows || rows.length === 0) {
+    return `<div class="text-center py-8 muted text-xs">
+      ${shadow
+        ? 'No shadow data yet. Set <code class="bg-gray-800 px-1 rounded">STRATEGY_MODE=shadow</code> in your .env to start collecting.'
+        : 'No resolved trades yet.'}
+    </div>`;
+  }
+  const colOpen = shadow ? `<th class="px-4 py-2 text-right">Evaluated</th>` : `<th class="px-4 py-2 text-right">Open</th>`;
+  const rowsHtml = rows.map(r => {
+    const openVal = shadow ? r.total : r.open;
+    const wr = r.resolved > 0 ? `${r.win_rate}%` : '<span class="muted">—</span>';
+    return `
+      <tr class="row" style="border-top:1px solid #21262d">
+        <td class="px-4 py-2.5 font-semibold text-white">${r.strategy}</td>
+        <td class="px-4 py-2.5 text-right muted">${openVal}</td>
+        <td class="px-4 py-2.5 text-right muted">${r.resolved}</td>
+        <td class="px-4 py-2.5 text-right">${wr}</td>
+        <td class="px-4 py-2.5 text-right font-semibold ${pnlCls(r.pnl)}">${fmtPnl(r.pnl)}</td>
+      </tr>
+    `;
+  }).join('');
+  return `
+    <table class="w-full text-xs">
+      <thead style="background:#1c2128;color:#8b949e" class="uppercase tracking-wider text-xs">
+        <tr>
+          <th class="px-4 py-2 text-left">Strategy</th>
+          ${colOpen}
+          <th class="px-4 py-2 text-right">Resolved</th>
+          <th class="px-4 py-2 text-right">Win Rate</th>
+          <th class="px-4 py-2 text-right">${shadow ? 'Hypothetical P&L' : 'P&L'}</th>
+        </tr>
+      </thead>
+      <tbody>${rowsHtml}</tbody>
+    </table>
+    ${shadow ? '<p class="px-4 py-2 text-xs muted" style="border-top:1px solid #21262d">Hypothetical outcomes only — no real budget was spent on shadow trades.</p>' : ''}
+  `;
+}
+
+function renderStrategyStats(data) {
+  document.getElementById('tab-real-content').innerHTML    = buildStratTable(data.real,   false);
+  document.getElementById('tab-shadow-content').innerHTML  = buildStratTable(data.shadow, true);
+  if (!data.shadow || data.shadow.length === 0) {
+    document.getElementById('shadow-hint').classList.remove('hidden');
+  } else {
+    document.getElementById('shadow-hint').classList.add('hidden');
+  }
+}
+
+function switchTab(tab) {
+  const isReal = tab === 'real';
+  document.getElementById('tab-real-content').classList.toggle('hidden', !isReal);
+  document.getElementById('tab-shadow-content').classList.toggle('hidden', isReal);
+  document.getElementById('tab-real-btn').className   = `px-4 py-3 text-xs font-semibold ${isReal ? 'tab-active' : 'tab-inactive'}`;
+  document.getElementById('tab-shadow-btn').className = `px-4 py-3 text-xs font-semibold ${isReal ? 'tab-inactive' : 'tab-active'}`;
+}
+
+// ── P&L Chart ─────────────────────────────────────────────
+function renderPnlChart(points) {
+  const canvas = document.getElementById('pnl-chart');
+  const ctx    = canvas.getContext('2d');
+  const latest = points.length ? points[points.length - 1].pnl : null;
+
+  document.getElementById('pnl-total').innerHTML =
+    latest != null ? `<span class="${pnlCls(latest)}">${fmtPnl(latest)}</span>` : '—';
+
+  if (pnlChart) { pnlChart.destroy(); pnlChart = null; }
+
+  if (points.length === 0) {
+    ctx.fillStyle = '#8b949e';
+    ctx.font = '12px ui-monospace, monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('No resolved trades yet', canvas.width / 2, 80);
+    return;
+  }
+
+  const color = (latest ?? 0) >= 0 ? '#3fb950' : '#f85149';
+  const grad  = ctx.createLinearGradient(0, 0, 0, 160);
+  grad.addColorStop(0, color + '40');
+  grad.addColorStop(1, color + '00');
+
+  pnlChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: points.map(p => p.ts),
+      datasets: [{
+        data: points.map(p => p.pnl),
+        borderColor: color,
+        backgroundColor: grad,
+        fill: true,
+        tension: 0.35,
+        pointRadius: points.length > 40 ? 0 : 3,
+        pointHoverRadius: 5,
+        borderWidth: 2,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: '#1c2128',
+          borderColor: '#30363d',
+          borderWidth: 1,
+          titleColor: '#8b949e',
+          bodyColor: '#e6edf3',
+          callbacks: { label: c => ` ${fmtPnl(c.raw)}` }
+        }
+      },
+      scales: {
+        x: { grid: { color: '#21262d' }, ticks: { color: '#8b949e', maxTicksLimit: 8, font: { size: 10 } } },
+        y: { grid: { color: '#21262d' }, ticks: { color: '#8b949e', font: { size: 10 }, callback: v => `$${v}` } }
+      }
+    }
+  });
+}
+
+// ── Trades table ──────────────────────────────────────────
+function setFilter(f) {
+  tradeFilter = f;
+  ['all', 'open', 'resolved'].forEach(id => {
+    document.getElementById(`f-${id}`).className =
+      `text-xs px-3 py-1 rounded ${f === id ? 'filter-on' : 'filter-off'}`;
+  });
+  renderTradesTable();
+}
+
+function renderTradesTable() {
+  const list = allTrades.filter(t => {
+    if (tradeFilter === 'open')     return !t.resolved;
+    if (tradeFilter === 'resolved') return  t.resolved;
+    return true;
+  });
+
+  const tbody = document.getElementById('trades-tbody');
+  const empty = document.getElementById('trades-empty');
+
+  if (list.length === 0) {
+    tbody.innerHTML = '';
+    empty.classList.remove('hidden');
+    return;
+  }
+  empty.classList.add('hidden');
+
+  tbody.innerHTML = list.map(t => {
+    const tag     = (JSON.parse(t.tags || '[]')[0]) || '—';
+    const dirBadge = `<span class="badge ${t.direction === 'yes' ? 'badge-yes' : 'badge-no'}">${t.direction.toUpperCase()}</span>`;
+    let statusHtml;
+    if (!t.resolved) {
+      statusHtml = `<span class="badge badge-open">OPEN</span>`;
+    } else if (t.outcome === t.direction) {
+      statusHtml = `<span class="badge badge-won">WON</span>`;
+    } else {
+      statusHtml = `<span class="badge badge-lost">LOST</span>`;
+    }
+    return `
+      <tr class="row" style="border-top:1px solid #21262d">
+        <td class="px-3 py-2 muted">${t.id}</td>
+        <td class="px-3 py-2" style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${t.market_name}">${t.market_name}</td>
+        <td class="px-3 py-2 text-center">${dirBadge}</td>
+        <td class="px-3 py-2 text-right muted">${(t.price * 100).toFixed(1)}%</td>
+        <td class="px-3 py-2 text-right">$${t.amount.toFixed(2)}</td>
+        <td class="px-3 py-2 muted">${tag}</td>
+        <td class="px-3 py-2 text-center">${statusHtml}</td>
+        <td class="px-3 py-2 text-right font-medium">${pnlSpan(t.pnl)}</td>
+        <td class="px-3 py-2 muted">${fmtDate(t.ts)}</td>
+      </tr>
+    `;
+  }).join('');
+}
+
+// ── Scan log ──────────────────────────────────────────────
+function renderScanLog(scans) {
+  const tbody = document.getElementById('scan-tbody');
+  const empty = document.getElementById('scan-empty');
+  if (!scans || scans.length === 0) {
+    tbody.innerHTML = '';
+    empty.classList.remove('hidden');
+    return;
+  }
+  empty.classList.add('hidden');
+  tbody.innerHTML = scans.map(s => `
+    <tr class="row" style="border-top:1px solid #21262d">
+      <td class="px-3 py-2 muted">${fmtDate(s.ts)}</td>
+      <td class="px-3 py-2 text-right muted">${s.markets_checked}</td>
+      <td class="px-3 py-2 text-right ${s.signals_found > 0 ? 'text-yellow-400' : 'muted'}">${s.signals_found}</td>
+      <td class="px-3 py-2 text-right ${s.trades_placed  > 0 ? 'pos' : 'muted'}">${s.trades_placed}</td>
+    </tr>
+  `).join('');
+}
+
+// ── Fetch & render all ────────────────────────────────────
+async function refresh() {
+  try {
+    const [ov, strat, trades, pnl, scans] = await Promise.all([
+      fetch('/api/overview').then(r => r.json()),
+      fetch('/api/strategy-stats').then(r => r.json()),
+      fetch('/api/trades').then(r => r.json()),
+      fetch('/api/pnl-history').then(r => r.json()),
+      fetch('/api/scan-log').then(r => r.json()),
+    ]);
+    renderStatCards(ov);
+    renderStrategyStats(strat);
+    allTrades = trades;
+    renderTradesTable();
+    renderPnlChart(pnl);
+    renderScanLog(scans);
+    document.getElementById('last-updated').textContent =
+      'Updated ' + new Date().toLocaleTimeString();
+  } catch (e) {
+    document.getElementById('last-updated').textContent = 'Error loading data';
+  }
+}
+
+// ── Countdown ─────────────────────────────────────────────
+function startCountdown() {
+  countdown = 60;
+  clearInterval(countdownTimer);
+  countdownTimer = setInterval(() => {
+    countdown--;
+    document.getElementById('countdown-val').textContent = countdown;
+    if (countdown <= 0) { refresh(); countdown = 60; }
+  }, 1000);
+}
+
+refresh();
+startCountdown();
+</script>
+</body>
+</html>
