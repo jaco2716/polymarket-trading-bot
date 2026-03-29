@@ -53,7 +53,8 @@ CFG = {
     "MIN_LIQUIDITY":      float(os.getenv("MIN_LIQUIDITY",    "2000")),  # skip thin markets
     "PRICE_MIN":          float(os.getenv("PRICE_MIN",        "0.10")),  # skip extreme longshots
     "PRICE_MAX":          float(os.getenv("PRICE_MAX",        "0.90")),
-    "MARKETS_PER_SCAN":   int(os.getenv("MARKETS_PER_SCAN",   "30")),    # top N by volume
+    "MARKET_POOL_SIZE":   int(os.getenv("MARKET_POOL_SIZE",   "100")),   # fetch this many, then rank and pick best
+    "MARKETS_PER_SCAN":   int(os.getenv("MARKETS_PER_SCAN",   "20")),    # top N to send to Haiku after ranking
 
     # Strategies
     "ENABLE_HAIKU":       os.getenv("ENABLE_HAIKU",       "true").lower() == "true",
@@ -200,23 +201,27 @@ def get(url: str, params: dict = None, timeout: int = 10) -> Optional[dict]:
 
 # ── Gamma API — market discovery ──────────────────────────────────────────────
 def fetch_markets(randomize: bool = False) -> list[dict]:
-    """Fetch active, liquid binary markets sorted by volume.
-    In shadow mode (randomize=True) pulls a larger pool and shuffles it
-    so each scan evaluates a different cross-section of markets.
+    """Fetch a large pool of active markets, rank by interest score, return top MARKETS_PER_SCAN.
+
+    Scoring (higher = more worth analysing):
+      - 70% closeness to 50/50: markets near fair value are most likely to be mispriced
+      - 30% normalised volume:  liquid markets are easier to act on
+
+    In shadow mode (randomize=True) shuffles the scored pool so different markets
+    get coverage across scans instead of always seeing the same top-N.
     """
-    pool_size = CFG["MARKETS_PER_SCAN"] * 6 if randomize else CFG["MARKETS_PER_SCAN"] * 3
     data = get(f"{GAMMA_URL}/markets", params={
-        "active": "true",
-        "closed": "false",
-        "limit":  pool_size,
-        "order":  "volume24hr",
+        "active":    "true",
+        "closed":    "false",
+        "limit":     CFG["MARKET_POOL_SIZE"],
+        "order":     "volume24hr",
         "ascending": "false",
     })
     if not data:
         return []
 
     markets = data if isinstance(data, list) else data.get("markets", [])
-    result = []
+    pool = []
 
     for m in markets:
         try:
@@ -228,7 +233,6 @@ def fetch_markets(randomize: bool = False) -> list[dict]:
             if prices_raw is None:
                 continue
 
-            # Parse price for YES outcome
             if isinstance(prices_raw, str):
                 prices = json.loads(prices_raw)
                 yes_price = float(prices[0]) if prices else None
@@ -244,31 +248,43 @@ def fetch_markets(randomize: bool = False) -> list[dict]:
 
             tokens = m.get("tokens") or m.get("clobTokenIds") or []
             token_id = tokens[0] if tokens else m.get("conditionId")
+            volume = float(m.get("volume24hr") or m.get("volume") or 0)
 
-            result.append({
+            pool.append({
                 "id":         m.get("id") or m.get("conditionId", ""),
                 "name":       m.get("question") or m.get("title", "Unknown"),
                 "yes_price":  yes_price,
                 "no_price":   round(1 - yes_price, 4),
                 "liquidity":  liquidity,
-                "volume_24h": float(m.get("volume24hr") or m.get("volume") or 0),
+                "volume_24h": volume,
                 "token_id":   token_id,
                 "end_date":   m.get("endDate") or m.get("endDateIso"),
                 "slug":       m.get("slug", ""),
                 "tags":       m.get("tags") or [],
             })
-
-            if len(result) >= (CFG["MARKETS_PER_SCAN"] * 2 if randomize else CFG["MARKETS_PER_SCAN"]):
-                break
-
         except (TypeError, ValueError, KeyError):
             continue
 
-    if randomize and len(result) > CFG["MARKETS_PER_SCAN"]:
-        random.shuffle(result)
-        result = result[:CFG["MARKETS_PER_SCAN"]]
+    if not pool:
+        return []
 
-    log.info(f"Fetched {len(result)} qualifying markets")
+    # Score each market
+    max_vol = max(m["volume_24h"] for m in pool) or 1
+    for m in pool:
+        closeness = 1.0 - abs(m["yes_price"] - 0.5) * 2   # 1.0 at 50/50, 0.0 at extremes
+        vol_norm  = m["volume_24h"] / max_vol
+        m["_score"] = closeness * 0.7 + vol_norm * 0.3
+
+    if randomize:
+        # Pure random sample across the full pool — no scoring bias.
+        # Shadow mode needs coverage of all market types to learn which are actually profitable.
+        random.shuffle(pool)
+        result = pool[:CFG["MARKETS_PER_SCAN"]]
+    else:
+        pool.sort(key=lambda m: -m["_score"])
+        result = pool[:CFG["MARKETS_PER_SCAN"]]
+
+    log.info(f"Fetched {len(pool)} qualifying markets → selected top {len(result)} by interest score")
     return result
 
 # ── Data API — whale tracking ─────────────────────────────────────────────────
