@@ -53,6 +53,8 @@ CFG = {
     "MIN_LIQUIDITY":      float(os.getenv("MIN_LIQUIDITY",    "2000")),  # skip thin markets
     "PRICE_MIN":          float(os.getenv("PRICE_MIN",        "0.10")),  # skip extreme longshots
     "PRICE_MAX":          float(os.getenv("PRICE_MAX",        "0.90")),
+    "MAX_TRADE_PRICE":    float(os.getenv("MAX_TRADE_PRICE",  "0.85")),  # skip near-certain outcomes (tiny payout)
+    "MAX_RESOLVE_HOURS":  float(os.getenv("MAX_RESOLVE_HOURS", "0")),    # 0 = no limit; set e.g. 24 for same-day markets only
     "MARKET_POOL_SIZE":   int(os.getenv("MARKET_POOL_SIZE",   "100")),   # fetch this many, then rank and pick best
     "MARKETS_PER_SCAN":   int(os.getenv("MARKETS_PER_SCAN",   "20")),    # top N to send to Haiku after ranking
 
@@ -247,6 +249,23 @@ def fetch_markets(randomize: bool = False) -> list[dict]:
                 continue
             if not (CFG["PRICE_MIN"] <= yes_price <= CFG["PRICE_MAX"]):
                 continue
+
+            # Skip if both sides exceed MAX_TRADE_PRICE (near-certain outcome, tiny payout)
+            no_price = round(1 - yes_price, 4)
+            if max(yes_price, no_price) > CFG["MAX_TRADE_PRICE"]:
+                continue
+
+            # Skip if market resolves too far in the future (MAX_RESOLVE_HOURS > 0)
+            if CFG["MAX_RESOLVE_HOURS"] > 0:
+                end_date_str = m.get("endDate") or m.get("endDateIso")
+                if end_date_str:
+                    try:
+                        end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                        hours_left = (end_dt - datetime.now(timezone.utc)).total_seconds() / 3600
+                        if hours_left > CFG["MAX_RESOLVE_HOURS"] or hours_left < 0:
+                            continue
+                    except ValueError:
+                        pass  # can't parse date, allow it through
 
             tokens = m.get("tokens") or m.get("clobTokenIds") or []
             token_id = tokens[0] if tokens else m.get("conditionId")
@@ -645,6 +664,58 @@ def place_paper_trade(
     )
     return new_budget
 
+# ── Shared resolution helper ──────────────────────────────────────────────────
+def get_market_winner(market_id: str) -> Optional[str]:
+    """
+    Return 'yes', 'no', or None (still open / unclear).
+    Numeric IDs → Gamma API. ConditionId hashes (0x...) → CLOB API.
+    """
+    is_hash = str(market_id).startswith("0x")
+
+    if is_hash:
+        data = get(f"{CLOB_URL}/markets/{market_id}")
+        if not data or not isinstance(data, dict):
+            return None
+        if not data.get("closed"):
+            return None
+        for token in data.get("tokens") or []:
+            if token.get("winner"):
+                return str(token.get("outcome", "")).lower()
+        return None
+    else:
+        data = get(f"{GAMMA_URL}/markets/{market_id}")
+        if not data:
+            return None
+        m = data[0] if isinstance(data, list) else data
+        if not m.get("closed") and not m.get("resolved"):
+            return None
+        # Standard resolution fields
+        if m.get("winner"):
+            return str(m["winner"]).lower()
+        if m.get("resolvedAt") or m.get("resolution"):
+            res = str(m.get("resolution") or "").lower()
+            return "yes" if res in ("1", "true", "yes") else "no"
+        # outcomePrices fallback: ["1","0"] = YES won, ["0","1"] = NO won
+        prices = m.get("outcomePrices")
+        if prices and len(prices) >= 2:
+            try:
+                yes_p, no_p = float(prices[0]), float(prices[1])
+                if yes_p >= 0.99:
+                    return "yes"
+                if no_p >= 0.99:
+                    return "no"
+            except (ValueError, TypeError):
+                pass
+        # CLOB fallback via conditionId
+        condition_id = m.get("conditionId") or m.get("condition_id")
+        if condition_id:
+            clob_data = get(f"{CLOB_URL}/markets/{condition_id}")
+            if clob_data and isinstance(clob_data, dict) and clob_data.get("closed"):
+                for token in clob_data.get("tokens") or []:
+                    if token.get("winner"):
+                        return str(token.get("outcome", "")).lower()
+        return None
+
 # ── Auto-resolver: checks if open trades have settled ─────────────────────────
 def resolve_settled_trades(con) -> float:
     """
@@ -662,26 +733,9 @@ def resolve_settled_trades(con) -> float:
     budget = load_budget()
 
     for row_id, market_id, direction, price, amount, fee in rows:
-        data = get(f"{GAMMA_URL}/markets/{market_id}")
-        if not data:
-            continue
-
-        # Accept both list and dict responses
-        m = data[0] if isinstance(data, list) else data
-
-        if not m.get("closed") and not m.get("resolved"):
-            continue  # still open
-
-        # Determine winner
-        winner = None
-        if m.get("winner"):
-            winner = str(m["winner"]).lower()
-        elif m.get("resolvedAt") or m.get("resolution"):
-            res = str(m.get("resolution") or "").lower()
-            winner = "yes" if res in ("1", "true", "yes") else "no"
-
+        winner = get_market_winner(market_id)
         if not winner:
-            continue  # resolved but outcome unclear yet
+            continue
 
         won = (direction == winner)
         gross = amount * (1 - price) / price if won else -amount
@@ -744,19 +798,7 @@ def resolve_shadow_trades(con):
         return
 
     for row_id, market_id, direction, price, amount in rows:
-        data = get(f"{GAMMA_URL}/markets/{market_id}")
-        if not data:
-            continue
-        m = data[0] if isinstance(data, list) else data
-        if not m.get("closed") and not m.get("resolved"):
-            continue
-
-        winner = None
-        if m.get("winner"):
-            winner = str(m["winner"]).lower()
-        elif m.get("resolvedAt") or m.get("resolution"):
-            res = str(m.get("resolution") or "").lower()
-            winner = "yes" if res in ("1", "true", "yes") else "no"
+        winner = get_market_winner(market_id)
         if not winner:
             continue
 
