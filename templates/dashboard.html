@@ -427,7 +427,7 @@ function renderTradesTable() {
       return `
         <tr class="row" style="border-top:1px solid #21262d">
           <td class="px-3 py-2 muted">${t.id}</td>
-          <td class="px-3 py-2" style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${t.market_name}">${t.market_name}</td>
+          <td class="px-3 py-2" style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${t.notes ? t.market_name + ' — ' + t.notes : t.market_name}">${t.market_name}</td>
           <td class="px-3 py-2 text-center">${dirBadge}</td>
           <td class="px-3 py-2 text-right muted">${(t.price * 100).toFixed(1)}%</td>
           <td class="px-3 py-2 text-right muted">$${t.amount.toFixed(2)}</td>

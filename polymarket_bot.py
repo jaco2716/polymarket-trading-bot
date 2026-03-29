@@ -139,17 +139,19 @@ def init_db():
             price       REAL    NOT NULL,
             amount      REAL    NOT NULL,   -- hypothetical stake (no real budget impact)
             confidence  REAL,               -- haiku confidence score (NULL for whale-copy)
+            notes       TEXT,               -- reasoning: haiku explanation or whale context
             resolved    INTEGER DEFAULT 0,
             outcome     TEXT,
             pnl         REAL,
             close_ts    TEXT
         )
     """)
-    # Migrate existing shadow_trades table if confidence column is missing
-    try:
-        con.execute("ALTER TABLE shadow_trades ADD COLUMN confidence REAL")
-    except sqlite3.OperationalError:
-        pass  # column already exists
+    # Migrate existing shadow_trades table if columns are missing
+    for col, definition in [("confidence", "REAL"), ("notes", "TEXT")]:
+        try:
+            con.execute(f"ALTER TABLE shadow_trades ADD COLUMN {col} {definition}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
     con.commit()
     return con
 
@@ -299,7 +301,6 @@ def fetch_market_by_id(condition_id: str) -> Optional[dict]:
             return None
         tokens = data.get("tokens") or []
         yes_token = next((t for t in tokens if t.get("outcome", "").lower() == "yes"), None)
-        no_token  = next((t for t in tokens if t.get("outcome", "").lower() == "no"),  None)
         if not yes_token:
             return None
         yes_price = float(yes_token.get("price") or 0)
@@ -709,13 +710,13 @@ def resolve_settled_trades(con) -> float:
 
 # ── Shadow trade engine ───────────────────────────────────────────────────────
 def log_shadow_trade(con, strategy: str, market: dict, direction: str, price: float,
-                     confidence: Optional[float] = None):
+                     confidence: Optional[float] = None, notes: Optional[str] = None):
     """Record a hypothetical trade with no budget impact."""
     amount = round(CFG["STARTING_BUDGET"] * CFG["TRADE_SIZE_PCT"], 2)
     con.execute("""
         INSERT INTO shadow_trades
-            (ts, strategy, market_id, market_name, direction, price, amount, confidence)
-        VALUES (?,?,?,?,?,?,?,?)
+            (ts, strategy, market_id, market_name, direction, price, amount, confidence, notes)
+        VALUES (?,?,?,?,?,?,?,?,?)
     """, (
         datetime.now(timezone.utc).isoformat(),
         strategy,
@@ -725,11 +726,13 @@ def log_shadow_trade(con, strategy: str, market: dict, direction: str, price: fl
         price,
         amount,
         confidence,
+        notes,
     ))
     con.commit()
     conf_str = f" conf={confidence:.2f}" if confidence is not None else ""
     log.info(
         f"👻 Shadow [{strategy}]{conf_str}: {direction.upper()} on '{market['name'][:55]}' @ {price:.3f}"
+        + (f" | {notes[:80]}" if notes else "")
     )
 
 def resolve_shadow_trades(con):
@@ -862,7 +865,8 @@ def _run_haiku_slot(con, budget: float, markets: list[dict], traded: set,
         dir_  = analysis.get("direction", "yes")
         price = m["yes_price"] if dir_ == "yes" else m["no_price"]
         if shadow:
-            log_shadow_trade(con, "haiku-analyse", m, dir_, price, confidence=conf)
+            log_shadow_trade(con, "haiku-analyse", m, dir_, price,
+                             confidence=conf, notes=analysis.get("reasoning", ""))
         else:
             otype = analysis.get("order_type", "maker")
             new_budget = place_paper_trade(
@@ -911,7 +915,7 @@ def _run_whale_slot(con, budget: float, whale_signal: Optional[dict], traded: se
 
     if shadow:
         conf = float(analysis.get("confidence") or 0) if confirm_with_haiku and analysis else None
-        log_shadow_trade(con, tags[0], m, dir_, price, confidence=conf)
+        log_shadow_trade(con, tags[0], m, dir_, price, confidence=conf, notes=notes)
         traded.add(m["id"])
         return budget, 1, 1
 
