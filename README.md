@@ -47,7 +47,18 @@ caffeinate -i python3 polymarket_bot.py
 python3 dashboard.py
 ```
 
-Then open **http://localhost:5000** in your browser.
+Then open **http://localhost:5050** in your browser.
+
+**Access from your phone (or any device, any network):**
+
+Install [ngrok](https://ngrok.com/) and expose the dashboard:
+
+```bash
+brew install ngrok
+ngrok http 5050
+```
+
+ngrok gives you a public URL (e.g. `https://abc123.ngrok-free.app`) that you can open on your phone from anywhere.
 
 The bot creates these local files on first run:
 - `paper_trades.db` — SQLite database of all trades and scan history

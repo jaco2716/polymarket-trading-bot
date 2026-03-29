@@ -203,7 +203,8 @@ def scan_log():
 
 
 if __name__ == "__main__":
+    port = int(os.getenv("DASHBOARD_PORT", "5050"))
     print("━" * 50)
-    print("  📊 Dashboard → http://localhost:5000")
+    print(f"  📊 Dashboard → http://localhost:{port}")
     print("━" * 50)
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False)
