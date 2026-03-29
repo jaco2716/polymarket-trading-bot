@@ -18,7 +18,7 @@ Setup:
 All trades are paper-only. No real money moves.
 """
 
-import os, json, re, time, sqlite3, logging, sys, traceback, random
+import os, json, re, time, sqlite3, logging, logging.handlers, sys, traceback, random
 import urllib.parse
 import xml.etree.ElementTree as ET
 from dotenv import load_dotenv
@@ -33,7 +33,9 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-7s  %(message)s",
     handlers=[
-        logging.FileHandler("bot.log", encoding="utf-8"),
+        logging.handlers.RotatingFileHandler(
+            "bot.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8"
+        ),
         logging.StreamHandler(sys.stdout),
     ],
 )
@@ -63,7 +65,6 @@ CFG = {
     "SHADOW_HAIKU_MIN_CONF":  float(os.getenv("SHADOW_HAIKU_MIN_CONF", "0.35")),  # lower threshold for shadow data collection
     "HAIKU_SKIP_SPORTS":      os.getenv("HAIKU_SKIP_SPORTS", "true").lower() == "true",  # block game matchups/spreads
     "WHALE_MIN_SIZE":         float(os.getenv("WHALE_MIN_SIZE",   "500")),   # min USD for whale trade
-    "WHALE_LOOKBACK_MIN":     int(os.getenv("WHALE_LOOKBACK_MIN", "30")),    # minutes to look back
 
     # Limits
     "MAX_OPEN_TRADES":    int(os.getenv("MAX_OPEN_TRADES", "10")),
@@ -154,6 +155,12 @@ def init_db():
             con.execute(f"ALTER TABLE shadow_trades ADD COLUMN {col} {definition}")
         except sqlite3.OperationalError:
             pass  # column already exists
+    # Indexes for common queries
+    con.execute("CREATE INDEX IF NOT EXISTS idx_trades_resolved ON trades(resolved)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_trades_market_id ON trades(market_id)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_shadow_resolved ON shadow_trades(resolved)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_shadow_market_id ON shadow_trades(market_id)")
+    con.execute("PRAGMA journal_mode=WAL")
     con.commit()
     return con
 
@@ -167,8 +174,10 @@ def load_budget() -> float:
     return b
 
 def save_budget(b: float):
-    with open(BUDGET_FILE, "w") as f:
+    tmp = BUDGET_FILE + ".tmp"
+    with open(tmp, "w") as f:
         json.dump({"budget": round(b, 4)}, f)
+    os.replace(tmp, BUDGET_FILE)
 
 def open_trade_count(con) -> int:
     return con.execute("SELECT COUNT(*) FROM trades WHERE resolved=0").fetchone()[0]
@@ -199,14 +208,28 @@ def calc_fee(amount: float, price: float, order_type: str = "taker") -> float:
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "polymarket-paper-bot/1.0"})
 
-def get(url: str, params: dict = None, timeout: int = 10) -> Optional[dict]:
-    try:
-        r = SESSION.get(url, params=params, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        log.warning(f"GET {url} failed: {e}")
-        return None
+def get(url: str, params: dict = None, timeout: int = 10, retries: int = 3) -> Optional[dict]:
+    for attempt in range(retries):
+        try:
+            r = SESSION.get(url, params=params, timeout=timeout)
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < retries - 1:
+                wait = 2 ** attempt
+                log.warning(f"GET {url} → {r.status_code}, retrying in {wait}s...")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.RequestException as e:
+            if attempt < retries - 1:
+                log.warning(f"GET {url} failed (attempt {attempt+1}): {e}")
+                time.sleep(2 ** attempt)
+                continue
+            log.warning(f"GET {url} failed after {retries} attempts: {e}")
+            return None
+        except json.JSONDecodeError as e:
+            log.warning(f"GET {url} returned invalid JSON: {e} — body: {r.text[:200]}")
+            return None
+    return None
 
 # ── Gamma API — market discovery ──────────────────────────────────────────────
 def fetch_markets(randomize: bool = False) -> list[dict]:
@@ -501,6 +524,10 @@ NEWS_CACHE_TTL = 3600  # seconds
 def fetch_news_headlines(query: str, max_items: int = 5) -> list[str]:
     """Fetch recent headlines from Google News RSS. Cached for 1 hour."""
     now = time.time()
+    # Evict expired entries to prevent unbounded growth
+    expired = [k for k, (ts, _) in _news_cache.items() if now - ts >= NEWS_CACHE_TTL]
+    for k in expired:
+        del _news_cache[k]
     if query in _news_cache:
         cached_at, headlines = _news_cache[query]
         if now - cached_at < NEWS_CACHE_TTL:
@@ -603,11 +630,22 @@ def haiku_analyse(market: dict, shadow: bool = False) -> Optional[dict]:
         )
         raw = resp.content[0].text.strip()
         # Strip any accidental markdown fences
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
+        raw = re.sub(r'^```(?:json)?\s*', '', raw)
+        raw = re.sub(r'\s*```$', '', raw)
         result = json.loads(raw)
+        # Validate response fields
+        if result.get("direction") not in ("yes", "no"):
+            log.warning(f"Haiku returned invalid direction: {result.get('direction')}")
+            return None
+        conf = result.get("confidence")
+        if conf is not None:
+            try:
+                conf = max(0.0, min(1.0, float(conf)))
+                result["confidence"] = conf
+            except (ValueError, TypeError):
+                result["confidence"] = 0.0
+        if "edge" in result and not isinstance(result["edge"], bool):
+            result["edge"] = str(result["edge"]).lower() == "true"
         log.info(
             f"🤖 Haiku: '{market['name'][:45]}…' → "
             f"edge={result.get('edge')} conf={result.get('confidence'):.2f} "
@@ -647,7 +685,7 @@ def place_paper_trade(
         return None
 
     fee = calc_fee(amount, price, order_type)
-    new_budget = budget - amount
+    new_budget = budget - amount - fee
 
     con.execute("""
         INSERT INTO trades
@@ -741,15 +779,24 @@ def resolve_settled_trades(con) -> float:
     Returns total P&L from newly resolved trades.
     """
     rows = con.execute(
-        "SELECT id, market_id, direction, price, amount, fee FROM trades WHERE resolved=0"
+        "SELECT id, market_id, direction, price, amount, fee, ts FROM trades WHERE resolved=0"
     ).fetchall()
     if not rows:
         return 0.0
 
     total_pnl = 0.0
     budget = load_budget()
+    now = datetime.now(timezone.utc)
 
-    for row_id, market_id, direction, price, amount, fee in rows:
+    for row_id, market_id, direction, price, amount, fee, ts in rows:
+        # Warn about stale trades
+        try:
+            age = (now - datetime.fromisoformat(ts)).days
+            if age > 14:
+                log.warning(f"Trade #{row_id} has been open for {age} days — may need manual review")
+        except (ValueError, TypeError):
+            pass
+
         winner = get_market_winner(market_id)
         if not winner:
             continue
@@ -765,7 +812,7 @@ def resolve_settled_trades(con) -> float:
         """, (winner, round(pnl, 4), datetime.now(timezone.utc).isoformat(), row_id))
         con.commit()
 
-        budget += amount + pnl
+        budget += amount + fee + pnl
         total_pnl += pnl
 
         status = "✅ WON" if won else "❌ LOST"
@@ -811,12 +858,20 @@ def log_shadow_trade(con, strategy: str, market: dict, direction: str, price: fl
 def resolve_shadow_trades(con):
     """Check open shadow trades against market outcomes and record hypothetical P&L."""
     rows = con.execute(
-        "SELECT id, market_id, direction, price, amount, fee FROM shadow_trades WHERE resolved=0"
+        "SELECT id, market_id, direction, price, amount, fee, ts FROM shadow_trades WHERE resolved=0"
     ).fetchall()
     if not rows:
         return
 
-    for row_id, market_id, direction, price, amount, fee in rows:
+    now = datetime.now(timezone.utc)
+    for row_id, market_id, direction, price, amount, fee, ts in rows:
+        try:
+            age = (now - datetime.fromisoformat(ts)).days
+            if age > 14:
+                log.warning(f"Shadow trade #{row_id} has been open for {age} days — may need manual review")
+        except (ValueError, TypeError):
+            pass
+
         winner = get_market_winner(market_id)
         if not winner:
             continue
@@ -908,8 +963,9 @@ def _run_haiku_slot(con, budget: float, markets: list[dict], traded: set,
                     shadow: bool = False) -> tuple[float, int, int]:
     """Run the standalone Haiku strategy. Returns (new_budget, signals, trades)."""
     signals = trades = 0
-    log.info(f"[haiku-analyse] Scanning top {min(10, len(markets))} markets...")
-    for m in markets[:10]:
+    scan_limit = CFG["MARKETS_PER_SCAN"]
+    log.info(f"[haiku-analyse] Scanning top {min(scan_limit, len(markets))} markets...")
+    for m in markets[:scan_limit]:
         if m["id"] in traded:
             continue
         if CFG["HAIKU_SKIP_SPORTS"] and _is_sports_matchup(m["name"]):
@@ -1100,6 +1156,23 @@ def main():
 
     if not CFG["ANTHROPIC_API_KEY"] and CFG["ENABLE_HAIKU"]:
         log.error("ANTHROPIC_API_KEY not set. Run: export ANTHROPIC_API_KEY='sk-ant-...'")
+        sys.exit(1)
+
+    # Validate config bounds
+    errors = []
+    if not (0 < CFG["TRADE_SIZE_PCT"] < 1):
+        errors.append(f"TRADE_SIZE_PCT must be between 0 and 1, got {CFG['TRADE_SIZE_PCT']}")
+    if not (0 < CFG["MAX_TRADE_PRICE"] < 1):
+        errors.append(f"MAX_TRADE_PRICE must be between 0 and 1, got {CFG['MAX_TRADE_PRICE']}")
+    if CFG["STARTING_BUDGET"] <= 0:
+        errors.append(f"STARTING_BUDGET must be positive, got {CFG['STARTING_BUDGET']}")
+    if CFG["SCAN_INTERVAL"] < 60:
+        errors.append(f"SCAN_INTERVAL must be >= 60 seconds, got {CFG['SCAN_INTERVAL']}")
+    if CFG["STRATEGY_MODE"] not in ("compete", "parallel", "shadow"):
+        errors.append(f"STRATEGY_MODE must be compete|parallel|shadow, got '{CFG['STRATEGY_MODE']}'")
+    if errors:
+        for e in errors:
+            log.error(f"Config error: {e}")
         sys.exit(1)
 
     con = init_db()

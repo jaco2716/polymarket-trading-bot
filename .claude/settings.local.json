@@ -11,7 +11,9 @@
       "Bash(curl -s 'https://gamma-api.polymarket.com/markets?question_id=0x1b60207d30d186fd02577000dbebbbb16d7548e2a681c0fd24beac65fa5d5047')",
       "Bash(curl -s 'https://gamma-api.polymarket.com/markets?slug=will-turkiye-win-on-2026-03-31')",
       "Bash(sqlite3:*)",
-      "Bash(curl -s 'https://gamma-api.polymarket.com/markets/1476583')"
+      "Bash(curl -s 'https://gamma-api.polymarket.com/markets/1476583')",
+      "Bash(grep -r \"^import\\\\|^from\" /Users/welin/Documents/Development/python-projects/polymarket-trading-bot/*.py)",
+      "Bash(pip show:*)"
     ]
   }
 }

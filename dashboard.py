@@ -11,9 +11,11 @@ import sqlite3
 from typing import Optional
 from flask import Flask, jsonify, render_template
 
-DB_FILE     = "paper_trades.db"
-BUDGET_FILE = "budget.json"
-app         = Flask(__name__)
+DB_FILE          = "paper_trades.db"
+BUDGET_FILE      = "budget.json"
+STARTING_BUDGET  = float(os.getenv("STARTING_BUDGET", "500"))
+SCAN_INTERVAL    = int(os.getenv("SCAN_INTERVAL", "3600"))
+app              = Flask(__name__)
 
 
 def db_query(sql: str, params: tuple = ()) -> list:
@@ -62,15 +64,17 @@ def overview():
     resolved = row.get("resolved_trades") or 0
     wins     = row.get("wins") or 0
     return jsonify({
-        "budget":          get_budget(),
-        "total_trades":    row.get("total_trades", 0),
-        "open_trades":     row.get("open_trades", 0),
-        "resolved_trades": resolved,
-        "wins":            wins,
-        "losses":          resolved - wins,
-        "total_pnl":       row.get("total_pnl") or 0,
-        "total_fees":      row.get("total_fees") or 0,
-        "win_rate":        round(wins / resolved * 100, 1) if resolved else 0,
+        "budget":           get_budget(),
+        "starting_budget":  STARTING_BUDGET,
+        "scan_interval":    SCAN_INTERVAL,
+        "total_trades":     row.get("total_trades", 0),
+        "open_trades":      row.get("open_trades", 0),
+        "resolved_trades":  resolved,
+        "wins":             wins,
+        "losses":           resolved - wins,
+        "total_pnl":        row.get("total_pnl") or 0,
+        "total_fees":       row.get("total_fees") or 0,
+        "win_rate":         round(wins / resolved * 100, 1) if resolved else 0,
     })
 
 
@@ -158,24 +162,23 @@ def pnl_history():
     points = []
     for r in rows:
         cumulative += r["pnl"]
-        points.append({"ts": (r["close_ts"] or "")[:10], "pnl": round(cumulative, 2)})
+        points.append({"ts": (r["close_ts"] or "")[:16], "pnl": round(cumulative, 2)})
     return jsonify(points)
 
 
 @app.route("/api/shadow-pnl-history")
 def shadow_pnl_history():
-    starting = 500.0
     rows = db_query("""
         SELECT close_ts, pnl FROM shadow_trades
         WHERE resolved=1 AND pnl IS NOT NULL
         ORDER BY close_ts ASC
     """)
-    balance = starting
+    balance = STARTING_BUDGET
     points = [{"ts": None, "pnl": round(balance, 2)}]
     for r in rows:
         balance += r["pnl"]
         points.append({"ts": (r["close_ts"] or "")[:16], "pnl": round(balance, 2)})
-    return jsonify(points)
+    return jsonify({"starting_budget": STARTING_BUDGET, "points": points})
 
 
 @app.route("/api/scan-log")

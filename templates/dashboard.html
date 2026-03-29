@@ -161,7 +161,9 @@ let pnlChart       = null;
 let chartMode      = 'real';
 let cachedRealPnl  = [];
 let cachedShadowPnl = [];
-let countdown      = 60;
+let startingBudget  = 500;
+let refreshInterval = 60;
+let countdown       = 60;
 let countdownTimer;
 
 // ── Formatters ────────────────────────────────────────────
@@ -173,7 +175,7 @@ const pnlSpan = n => `<span class="${pnlCls(n)}">${fmtPnl(n)}</span>`;
 
 // ── Stat cards ────────────────────────────────────────────
 function renderStatCards(ov) {
-  const starting = 500; // reference point
+  const starting = startingBudget;
   const budgetChange = ov.budget != null ? ov.budget - starting : null;
 
   const cards = [
@@ -187,7 +189,7 @@ function renderStatCards(ov) {
       label: 'Total P&L',
       value: fmtPnl(ov.total_pnl),
       valueCls: pnlCls(ov.total_pnl),
-      sub: `Fees: $${(ov.total_fees || 0).toFixed(4)}`,
+      sub: `Fees: $${(ov.total_fees || 0).toFixed(2)}`,
       subCls: 'muted',
     },
     {
@@ -227,7 +229,7 @@ function buildStratTable(rows, shadow) {
   const rowsHtml = rows.map(r => {
     const openVal = shadow ? r.total : r.open;
     const wr = r.resolved > 0 ? `${r.win_rate}%` : '<span class="muted">—</span>';
-    const feesCell = shadow ? `<td class="px-4 py-2.5 text-right muted">$${(r.total_fees || 0).toFixed(3)}</td>` : '';
+    const feesCell = shadow ? `<td class="px-4 py-2.5 text-right muted">$${(r.total_fees || 0).toFixed(2)}</td>` : '';
     return `
       <tr class="row" style="border-top:1px solid #21262d">
         <td class="px-4 py-2.5 font-semibold text-white">${r.strategy}</td>
@@ -293,8 +295,7 @@ function drawChart(points, mode) {
 
   // Header value
   if (isShadow) {
-    const starting = 500;
-    const change = latest != null ? latest - starting : null;
+    const change = latest != null ? latest - startingBudget : null;
     document.getElementById('pnl-total').innerHTML = latest != null
       ? `<span class="${pnlCls(change)}">$${latest.toFixed(2)}</span><span class="text-xs muted ml-2">(${sign(change ?? 0)}$${Math.abs(change ?? 0).toFixed(2)})</span>`
       : '—';
@@ -314,9 +315,9 @@ function drawChart(points, mode) {
     return;
   }
 
-  const refVal  = isShadow ? 500 : 0;
+  const refVal  = isShadow ? startingBudget : 0;
   const color   = (latest ?? refVal) >= refVal ? '#3fb950' : '#f85149';
-  const grad    = ctx.createLinearGradient(0, 0, 0, 160);
+  const grad    = ctx.createLinearGradient(0, 0, 0, canvas.height);
   grad.addColorStop(0, color + '40');
   grad.addColorStop(1, color + '00');
 
@@ -433,10 +434,10 @@ function renderTradesTable() {
           <td class="px-3 py-2 muted">${t.id}</td>
           <td class="px-3 py-2" style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${t.notes ? t.market_name + ' — ' + t.notes : t.market_name}">${t.market_name}</td>
           <td class="px-3 py-2 text-center">${dirBadge}</td>
-          <td class="px-3 py-2 text-right muted">${(t.price * 100).toFixed(1)}%</td>
+          <td class="px-3 py-2 text-right muted">${t.price != null ? (t.price * 100).toFixed(1) + '%' : '—'}</td>
           <td class="px-3 py-2 text-right muted">
-            $${t.amount.toFixed(2)}
-            ${t.fee != null ? `<div class="text-xs" style="color:#6e7681">fee ${(t.fee).toFixed(3)}</div>` : ''}
+            ${t.amount != null ? '$' + t.amount.toFixed(2) : '—'}
+            ${t.fee != null ? `<div class="text-xs" style="color:#6e7681">fee $${t.fee.toFixed(2)}</div>` : ''}
           </td>
           <td class="px-3 py-2 muted">${t.strategy}</td>
           <td class="px-3 py-2 text-center">${confHtml}</td>
@@ -465,7 +466,9 @@ function renderTradesTable() {
   empty.classList.add('hidden');
 
   tbody.innerHTML = list.map(t => {
-    const tag      = (JSON.parse(t.tags || '[]')[0]) || '—';
+    let tags;
+    try { tags = JSON.parse(t.tags || '[]'); } catch { tags = []; }
+    const tagStr = tags.join(', ') || '—';
     const dirBadge = `<span class="badge ${t.direction === 'yes' ? 'badge-yes' : 'badge-no'}">${t.direction.toUpperCase()}</span>`;
     let statusHtml;
     if (!t.resolved) {
@@ -480,9 +483,12 @@ function renderTradesTable() {
         <td class="px-3 py-2 muted">${t.id}</td>
         <td class="px-3 py-2" style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${t.market_name}">${t.market_name}</td>
         <td class="px-3 py-2 text-center">${dirBadge}</td>
-        <td class="px-3 py-2 text-right muted">${(t.price * 100).toFixed(1)}%</td>
-        <td class="px-3 py-2 text-right">$${t.amount.toFixed(2)}</td>
-        <td class="px-3 py-2 muted">${tag}</td>
+        <td class="px-3 py-2 text-right muted">${t.price != null ? (t.price * 100).toFixed(1) + '%' : '—'}</td>
+        <td class="px-3 py-2 text-right">
+          ${t.amount != null ? '$' + t.amount.toFixed(2) : '—'}
+          ${t.fee != null ? `<div class="text-xs" style="color:#6e7681">fee $${t.fee.toFixed(2)}</div>` : ''}
+        </td>
+        <td class="px-3 py-2 muted">${tagStr}</td>
         <td class="px-3 py-2 text-center">${statusHtml}</td>
         <td class="px-3 py-2 text-right font-medium">${pnlSpan(t.pnl)}</td>
         <td class="px-3 py-2 muted">${fmtDate(t.ts)}</td>
@@ -523,12 +529,15 @@ async function refresh() {
       fetch('/api/shadow-pnl-history').then(r => r.json()),
       fetch('/api/scan-log').then(r => r.json()),
     ]);
+    startingBudget = ov.starting_budget || 500;
+    refreshInterval = Math.min(ov.scan_interval || 3600, 300);
+    const shadowPnlPoints = shadowPnl.points || shadowPnl;
     renderStatCards(ov);
     renderStrategyStats(strat);
     allTrades    = trades;
     shadowTrades = shadow;
     renderTradesTable();
-    renderPnlChart(pnl, shadowPnl);
+    renderPnlChart(pnl, shadowPnlPoints);
     renderScanLog(scans);
     document.getElementById('last-updated').textContent =
       'Updated ' + new Date().toLocaleTimeString();
@@ -539,12 +548,12 @@ async function refresh() {
 
 // ── Countdown ─────────────────────────────────────────────
 function startCountdown() {
-  countdown = 60;
+  countdown = refreshInterval;
   clearInterval(countdownTimer);
   countdownTimer = setInterval(() => {
     countdown--;
     document.getElementById('countdown-val').textContent = countdown;
-    if (countdown <= 0) { refresh(); countdown = 60; }
+    if (countdown <= 0) { refresh(); countdown = refreshInterval; }
   }, 1000);
 }
 
