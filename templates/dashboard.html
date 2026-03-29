@@ -96,14 +96,19 @@
 
     <!-- ── Trade history ── -->
     <div class="card overflow-hidden">
-      <div style="border-bottom:1px solid #21262d" class="px-4 py-3 flex items-center justify-between">
+      <div style="border-bottom:1px solid #21262d" class="px-4 py-3 flex flex-wrap items-center gap-y-2 justify-between">
         <h2 class="text-xs font-semibold muted uppercase tracking-wider">Trade History</h2>
-        <div class="flex gap-1.5">
+        <div class="flex gap-1.5 flex-wrap">
           <button onclick="setFilter('all')"      id="f-all"      class="text-xs px-3 py-1 rounded filter-on">All</button>
           <button onclick="setFilter('open')"     id="f-open"     class="text-xs px-3 py-1 rounded filter-off">Open</button>
           <button onclick="setFilter('resolved')" id="f-resolved" class="text-xs px-3 py-1 rounded filter-off">Resolved</button>
           <button onclick="setFilter('live')"     id="f-live"     class="text-xs px-3 py-1 rounded filter-off hidden">Live</button>
           <button onclick="setFilter('shadow')"   id="f-shadow"   class="text-xs px-3 py-1 rounded filter-off">Shadow</button>
+          <span class="text-xs muted self-center px-1">|</span>
+          <button onclick="setStrategyFilter('all')"            id="sf-all"            class="text-xs px-3 py-1 rounded filter-on">All Strats</button>
+          <button onclick="setStrategyFilter('haiku-analyse')"  id="sf-haiku-analyse"  class="text-xs px-3 py-1 rounded filter-off">Haiku</button>
+          <button onclick="setStrategyFilter('whale-copy')"     id="sf-whale-copy"     class="text-xs px-3 py-1 rounded filter-off">Whale</button>
+          <button onclick="setStrategyFilter('whale+haiku')"    id="sf-whale+haiku"    class="text-xs px-3 py-1 rounded filter-off">Whale+Haiku</button>
         </div>
         <div id="conf-filters" class="hidden flex gap-1.5">
           <span class="text-xs muted self-center">Conf:</span>
@@ -165,6 +170,7 @@ let allTrades      = [];
 let shadowTrades   = [];
 let liveTrades     = [];
 let tradeFilter    = 'all';
+let strategyFilter = 'all';
 let confFilter     = 'all';
 let pnlChart       = null;
 let chartMode      = 'real';
@@ -423,6 +429,15 @@ function setFilter(f) {
   renderTradesTable();
 }
 
+function setStrategyFilter(f) {
+  strategyFilter = f;
+  ['all', 'haiku-analyse', 'whale-copy', 'whale+haiku'].forEach(id => {
+    document.getElementById(`sf-${id}`).className =
+      `text-xs px-3 py-1 rounded ${f === id ? 'filter-on' : 'filter-off'}`;
+  });
+  renderTradesTable();
+}
+
 function setConfFilter(f) {
   confFilter = f;
   ['all', '0.35-0.45', '0.45-0.55', '0.55-0.65', '0.65+'].forEach(id => {
@@ -447,7 +462,11 @@ function renderTradesTable() {
 
   // Shadow trades have a different shape — render separately
   if (tradeFilter === 'shadow') {
-    const filtered = shadowTrades.filter(t => inConfBucket(t.confidence, confFilter));
+    const filtered = shadowTrades.filter(t => {
+      if (!inConfBucket(t.confidence, confFilter)) return false;
+      if (strategyFilter !== 'all' && t.strategy !== strategyFilter) return false;
+      return true;
+    });
     if (shadowTrades.length === 0) {
       tbody.innerHTML = '';
       empty.textContent = 'No shadow trades yet. Set STRATEGY_MODE=shadow in .env to collect data.';
@@ -456,7 +475,9 @@ function renderTradesTable() {
     }
     if (filtered.length === 0) {
       tbody.innerHTML = '';
-      empty.textContent = 'No shadow trades in this confidence range.';
+      empty.textContent = strategyFilter !== 'all'
+        ? `No ${strategyFilter} shadow trades in this range.`
+        : 'No shadow trades in this confidence range.';
       empty.classList.remove('hidden');
       return;
     }
@@ -498,15 +519,19 @@ function renderTradesTable() {
   // Real + live trades
   const source = tradeFilter === 'live' ? liveTrades : allTrades;
   const list = source.filter(t => {
-    if (tradeFilter === 'open')     return !t.resolved;
-    if (tradeFilter === 'resolved') return  t.resolved;
-    if (tradeFilter === 'live')     return true; // already filtered by source
+    // Status filter
+    if (tradeFilter === 'open'     && t.resolved)  return false;
+    if (tradeFilter === 'resolved' && !t.resolved) return false;
+    // Strategy filter
+    if (strategyFilter !== 'all') {
+      try { if (!JSON.parse(t.tags || '[]').includes(strategyFilter)) return false; } catch { return false; }
+    }
     return true;
   });
 
   if (list.length === 0) {
     tbody.innerHTML = '';
-    empty.textContent = tradeFilter === 'live' ? 'No live trades yet' : 'No trades yet';
+    empty.textContent = strategyFilter !== 'all' ? `No ${strategyFilter} trades yet` : tradeFilter === 'live' ? 'No live trades yet' : 'No trades yet';
     empty.classList.remove('hidden');
     return;
   }

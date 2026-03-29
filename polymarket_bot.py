@@ -70,6 +70,8 @@ CFG = {
     "ENABLE_WHALE_COPY":      os.getenv("ENABLE_WHALE_COPY",  "true").lower() == "true",
     "HAIKU_MIN_CONF":         float(os.getenv("HAIKU_MIN_CONF",        "0.65")),  # confidence threshold for real trades
     "SHADOW_HAIKU_MIN_CONF":  float(os.getenv("SHADOW_HAIKU_MIN_CONF", "0.35")),  # lower threshold for shadow data collection
+    "CONF_FLOOR":             float(os.getenv("CONF_FLOOR",             "0.45")),  # lowest confidence accepted (for low-price markets)
+    "SIZE_FLOOR":             float(os.getenv("SIZE_FLOOR",              "0.5")),   # min trade size fraction (for low-price markets)
     "HAIKU_SKIP_SPORTS":      os.getenv("HAIKU_SKIP_SPORTS", "true").lower() == "true",  # block game matchups/spreads
     "WHALE_MIN_SIZE":         float(os.getenv("WHALE_MIN_SIZE",   "500")),   # min USD for whale trade
 
@@ -298,6 +300,22 @@ def calc_fee(amount: float, price: float, order_type: str = "taker") -> float:
         return -amount * price * 0.002  # rebate
     rate = 0.018 * 4 * price * (1 - price)
     return amount * price * rate
+
+
+def price_scaled_params(price: float, base_conf: float, base_amount: float) -> tuple[float, float]:
+    """Scale confidence threshold and trade amount based on entry price.
+
+    Low-price markets (high payout) get a lower confidence bar and smaller
+    position size — the asymmetric payout compensates for lower conviction.
+
+    Returns (min_confidence, adjusted_amount).
+    """
+    lo, hi = 0.15, CFG["MAX_TRADE_PRICE"]
+    ratio = max(0.0, min(1.0, (price - lo) / (hi - lo)))
+    min_conf  = CFG["CONF_FLOOR"] + (base_conf - CFG["CONF_FLOOR"]) * ratio
+    size_mult = CFG["SIZE_FLOOR"] + (1.0 - CFG["SIZE_FLOOR"]) * ratio
+    return min_conf, round(base_amount * size_mult, 2)
+
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 SESSION = requests.Session()
@@ -817,7 +835,8 @@ def place_paper_trade(
         log.info("Max open trades reached — skipping")
         return None
 
-    amount = round(budget * CFG["TRADE_SIZE_PCT"], 2)
+    base_amount = round(budget * CFG["TRADE_SIZE_PCT"], 2)
+    _, amount = price_scaled_params(price, CFG["HAIKU_MIN_CONF"], base_amount)
     amount = max(amount, CFG["MIN_TRADE_USDC"])
 
     if amount > budget * 0.95:
@@ -849,10 +868,11 @@ def place_paper_trade(
     save_budget(new_budget)
 
     gross_if_win = amount * (1 - price) / price
+    size_pct = round(amount / base_amount * 100) if base_amount > 0 else 100
     log.info(
         f"📝 Paper trade logged:\n"
         f"   Market:  {market['name'][:60]}\n"
-        f"   {direction.upper()} @ {price:.3f}  |  ${amount:.2f} staked\n"
+        f"   {direction.upper()} @ {price:.3f}  |  ${amount:.2f} staked ({size_pct}% of base)\n"
         f"   Fee est: {fee:+.4f} USDC  |  Win payoff: +${gross_if_win:.2f}\n"
         f"   Tags:    {', '.join(tags)}\n"
         f"   Budget:  ${budget:.2f} → ${new_budget:.2f}"
@@ -879,7 +899,8 @@ def place_live_trade(
         log.info(f"Max live open trades ({CFG['LIVE_MAX_OPEN_TRADES']}) reached — skipping")
         return None
 
-    amount = round(budget * CFG["TRADE_SIZE_PCT"], 2)
+    base_amount = round(budget * CFG["TRADE_SIZE_PCT"], 2)
+    _, amount = price_scaled_params(price, CFG["HAIKU_MIN_CONF"], base_amount)
     amount = max(amount, CFG["MIN_TRADE_USDC"])
     amount = min(amount, CFG["MAX_LIVE_TRADE_USDC"])  # hard cap
 
@@ -912,10 +933,11 @@ def place_live_trade(
         ))
         con.commit()
         save_live_budget(new_budget)
+        size_pct = round(amount / base_amount * 100) if base_amount > 0 else 100
         log.info(
             f"🔸 DRY RUN — would place live trade:\n"
             f"   Market:   {market['name'][:60]}\n"
-            f"   {direction.upper()} @ {price:.3f}  |  ${amount:.2f}  |  token={token_id[:16]}…\n"
+            f"   {direction.upper()} @ {price:.3f}  |  ${amount:.2f} ({size_pct}% of base)  |  token={token_id[:16]}…\n"
             f"   Budget:   ${budget:.2f} → ${new_budget:.2f}"
         )
         return new_budget
@@ -943,10 +965,11 @@ def place_live_trade(
         elif hasattr(resp, "orderID"):
             order_id = resp.orderID
 
+        size_pct = round(amount / base_amount * 100) if base_amount > 0 else 100
         log.info(
             f"💰 LIVE trade placed!\n"
             f"   Market:   {market['name'][:60]}\n"
-            f"   {direction.upper()} @ {price:.3f}  |  ${amount:.2f} staked\n"
+            f"   {direction.upper()} @ {price:.3f}  |  ${amount:.2f} staked ({size_pct}% of base)\n"
             f"   Order ID: {order_id}\n"
             f"   Tags:     {', '.join(tags)}\n"
             f"   Budget:   ${budget:.2f} → ${new_budget:.2f}"
@@ -1109,7 +1132,8 @@ def log_shadow_trade(con, strategy: str, market: dict, direction: str, price: fl
                      confidence: Optional[float] = None, notes: Optional[str] = None):
     """Record a hypothetical trade, deducting from the virtual shadow budget."""
     shadow_budget = load_shadow_budget()
-    amount = round(shadow_budget * CFG["TRADE_SIZE_PCT"], 2)
+    base_amount = round(shadow_budget * CFG["TRADE_SIZE_PCT"], 2)
+    _, amount = price_scaled_params(price, CFG["SHADOW_HAIKU_MIN_CONF"], base_amount)
     amount = max(amount, CFG["MIN_TRADE_USDC"])
 
     if amount > shadow_budget * 0.95:
@@ -1138,10 +1162,11 @@ def log_shadow_trade(con, strategy: str, market: dict, direction: str, price: fl
     con.commit()
     save_shadow_budget(new_shadow_budget)
 
+    size_pct = round(amount / base_amount * 100) if base_amount > 0 else 100
     conf_str = f" conf={confidence:.2f}" if confidence is not None else ""
     log.info(
         f"👻 Shadow [{strategy}]{conf_str}: {direction.upper()} on '{market['name'][:55]}' @ {price:.3f}"
-        f"  |  ${amount:.2f} staked  |  Shadow budget: ${shadow_budget:.2f} → ${new_shadow_budget:.2f}"
+        f"  |  ${amount:.2f} staked ({size_pct}%)  |  Shadow budget: ${shadow_budget:.2f} → ${new_shadow_budget:.2f}"
         + (f" | {notes[:80]}" if notes else "")
     )
 
@@ -1285,8 +1310,11 @@ def _run_haiku_slot(con, budget: float, markets: list[dict], traded: set,
         time.sleep(0.5)
         if not analysis:
             continue
-        conf      = float(analysis.get("confidence") or 0)
-        min_conf  = CFG["SHADOW_HAIKU_MIN_CONF"] if shadow else CFG["HAIKU_MIN_CONF"]
+        conf  = float(analysis.get("confidence") or 0)
+        dir_  = analysis.get("direction", "yes")
+        price = m["yes_price"] if dir_ == "yes" else m["no_price"]
+        base_conf = CFG["SHADOW_HAIKU_MIN_CONF"] if shadow else CFG["HAIKU_MIN_CONF"]
+        min_conf, _ = price_scaled_params(price, base_conf, 0)
         # In shadow mode bypass the edge gate — confidence threshold alone decides.
         # In real mode both edge=true AND confidence threshold must pass.
         if shadow:
@@ -1296,8 +1324,6 @@ def _run_haiku_slot(con, budget: float, markets: list[dict], traded: set,
             if not analysis.get("edge") or conf < min_conf:
                 continue
         signals += 1
-        dir_  = analysis.get("direction", "yes")
-        price = m["yes_price"] if dir_ == "yes" else m["no_price"]
         if shadow:
             log_shadow_trade(con, "haiku-analyse", m, dir_, price,
                              confidence=conf, notes=analysis.get("reasoning", ""))
@@ -1338,7 +1364,8 @@ def _run_whale_slot(con, budget: float, whale_signal: Optional[dict], traded: se
         analysis = haiku_analyse(m)
         if not analysis:
             return budget, 1, 0
-        if not analysis.get("edge") or analysis.get("confidence", 0) < CFG["HAIKU_MIN_CONF"]:
+        scaled_conf, _ = price_scaled_params(price, CFG["HAIKU_MIN_CONF"], 0)
+        if not analysis.get("edge") or analysis.get("confidence", 0) < scaled_conf:
             log.info("[whale+haiku] Haiku rejected signal — skipping")
             return budget, 1, 0
         tags  = ["whale+haiku"]
