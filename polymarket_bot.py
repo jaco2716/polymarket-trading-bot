@@ -82,6 +82,10 @@ CFG = {
     # Cost scales linearly: 15min ≈ $12/mo, 10min ≈ $18/mo, 5min ≈ $36/mo
     "SHADOW_SCAN_INTERVAL": int(os.getenv("SHADOW_SCAN_INTERVAL", os.getenv("SCAN_INTERVAL", "3600"))),
 
+    # Low budget cooldown (seconds) — when trade size (TRADE_SIZE_PCT * budget) < MIN_TRADE_USDC,
+    # pause trading for this duration to let open trades resolve and free up budget.
+    "LOW_BUDGET_COOLDOWN": int(os.getenv("LOW_BUDGET_COOLDOWN", "7200")),  # default 2 hours
+
     # Whale wallet addresses to track (comma-separated env var or add below)
     "WHALE_WALLETS": [
         w.strip() for w in os.getenv("WHALE_WALLETS", "").split(",") if w.strip()
@@ -1234,6 +1238,37 @@ def main():
         scan_count = 0
         while True:
             try:
+                # Check if budget is too low to place trades
+                if CFG["STRATEGY_MODE"] == "shadow":
+                    current_budget = load_shadow_budget()
+                else:
+                    current_budget = load_budget()
+                trade_amount = current_budget * CFG["TRADE_SIZE_PCT"]
+
+                if trade_amount < CFG["MIN_TRADE_USDC"]:
+                    cooldown = CFG["LOW_BUDGET_COOLDOWN"]
+                    interval = CFG["SHADOW_SCAN_INTERVAL"] if CFG["STRATEGY_MODE"] == "shadow" else CFG["SCAN_INTERVAL"]
+                    log.info(
+                        f"Budget too low for new trades (${current_budget:.2f}, "
+                        f"trade size ${trade_amount:.2f} < ${CFG['MIN_TRADE_USDC']:.2f}) "
+                        f"— cooldown for {cooldown}s, resolving every {interval}s"
+                    )
+                    elapsed = 0
+                    while elapsed < cooldown:
+                        resolve_settled_trades(con)
+                        resolve_shadow_trades(con)
+                        # Check if budget has recovered enough to resume
+                        if CFG["STRATEGY_MODE"] == "shadow":
+                            current_budget = load_shadow_budget()
+                        else:
+                            current_budget = load_budget()
+                        if current_budget * CFG["TRADE_SIZE_PCT"] >= CFG["MIN_TRADE_USDC"]:
+                            log.info(f"Budget recovered to ${current_budget:.2f} — resuming scans")
+                            break
+                        time.sleep(interval)
+                        elapsed += interval
+                    continue
+
                 run_scan(con)
                 scan_count += 1
                 if scan_count % 12 == 0:  # print stats every ~hour

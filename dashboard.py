@@ -9,6 +9,8 @@ import json
 import os
 import sqlite3
 from typing import Optional
+from dotenv import load_dotenv
+load_dotenv()
 from flask import Flask, jsonify, render_template
 
 DB_FILE                 = "paper_trades.db"
