@@ -16,9 +16,11 @@ from flask import Flask, jsonify, render_template
 DB_FILE                 = "paper_trades.db"
 BUDGET_FILE             = "budget.json"
 SHADOW_BUDGET_FILE      = "shadow_budget.json"
+LIVE_BUDGET_FILE        = "live_budget.json"
 STARTING_BUDGET         = float(os.getenv("STARTING_BUDGET", "500"))
 SHADOW_STARTING_BUDGET  = float(os.getenv("SHADOW_STARTING_BUDGET", os.getenv("STARTING_BUDGET", "500")))
 SCAN_INTERVAL           = int(os.getenv("SCAN_INTERVAL", "3600"))
+STRATEGY_MODE           = os.getenv("STRATEGY_MODE", "compete")
 app                     = Flask(__name__)
 
 
@@ -55,6 +57,13 @@ def get_shadow_budget() -> Optional[float]:
         return json.load(f).get("budget")
 
 
+def get_live_budget() -> Optional[float]:
+    if not os.path.exists(LIVE_BUDGET_FILE):
+        return None
+    with open(LIVE_BUDGET_FILE) as f:
+        return json.load(f).get("budget")
+
+
 @app.route("/")
 def index():
     return render_template("dashboard.html")
@@ -79,11 +88,27 @@ def overview():
         SELECT COALESCE(ROUND(SUM(pnl), 2), 0) AS resolved_pnl
         FROM shadow_trades WHERE resolved=1
     """)
+
+    live_row = db_one("""
+        SELECT
+            COUNT(*)                                                    AS total_trades,
+            COALESCE(SUM(CASE WHEN resolved=0 THEN 1 ELSE 0 END), 0)   AS open_trades,
+            COALESCE(SUM(CASE WHEN resolved=1 THEN 1 ELSE 0 END), 0)   AS resolved_trades,
+            COALESCE(SUM(CASE WHEN pnl > 0   THEN 1 ELSE 0 END), 0)   AS wins,
+            COALESCE(ROUND(SUM(COALESCE(pnl, 0)), 2), 0)               AS total_pnl,
+            COALESCE(ROUND(SUM(COALESCE(fee, 0)), 4), 0)               AS total_fees
+        FROM trades WHERE mode IN ('live', 'live-dry')
+    """)
+    live_resolved = live_row.get("resolved_trades") or 0
+    live_wins     = live_row.get("wins") or 0
+
     return jsonify({
         "budget":                  get_budget(),
         "starting_budget":         STARTING_BUDGET,
         "shadow_budget":           get_shadow_budget(),
         "shadow_starting_budget":  SHADOW_STARTING_BUDGET,
+        "live_budget":             get_live_budget(),
+        "strategy_mode":           STRATEGY_MODE,
         "scan_interval":           SCAN_INTERVAL,
         "total_trades":     row.get("total_trades", 0),
         "open_trades":      row.get("open_trades", 0),
@@ -95,6 +120,14 @@ def overview():
         "win_rate":         round(wins / resolved * 100, 1) if resolved else 0,
         "resolved_pnl":     row.get("total_pnl") or 0,
         "shadow_resolved_pnl": shadow_row.get("resolved_pnl") or 0,
+        "live_total_trades":    live_row.get("total_trades") or 0,
+        "live_open_trades":     live_row.get("open_trades") or 0,
+        "live_resolved_trades": live_resolved,
+        "live_wins":            live_wins,
+        "live_losses":          live_resolved - live_wins,
+        "live_total_pnl":       live_row.get("total_pnl") or 0,
+        "live_total_fees":      live_row.get("total_fees") or 0,
+        "live_win_rate":        round(live_wins / live_resolved * 100, 1) if live_resolved else 0,
     })
 
 
@@ -157,8 +190,18 @@ def strategy_stats():
 def trades():
     return jsonify(db_query("""
         SELECT id, ts, market_name, direction, price, amount, fee,
-               order_type, tags, resolved, outcome, pnl, close_ts
+               order_type, tags, resolved, outcome, pnl, close_ts, mode, order_id
         FROM trades ORDER BY id DESC LIMIT 200
+    """))
+
+
+@app.route("/api/live-trades")
+def live_trades():
+    return jsonify(db_query("""
+        SELECT id, ts, market_name, direction, price, amount, fee,
+               order_type, tags, resolved, outcome, pnl, close_ts, mode, order_id
+        FROM trades WHERE mode IN ('live', 'live-dry')
+        ORDER BY id DESC LIMIT 200
     """))
 
 
@@ -199,6 +242,21 @@ def shadow_pnl_history():
         balance += r["pnl"]
         points.append({"ts": (r["close_ts"] or "")[:16], "pnl": round(balance, 2)})
     return jsonify({"starting_budget": SHADOW_STARTING_BUDGET, "points": points})
+
+
+@app.route("/api/live-pnl-history")
+def live_pnl_history():
+    rows = db_query("""
+        SELECT close_ts, pnl FROM trades
+        WHERE resolved=1 AND pnl IS NOT NULL AND mode IN ('live', 'live-dry')
+        ORDER BY close_ts ASC
+    """)
+    cumulative = 0.0
+    points = []
+    for r in rows:
+        cumulative += r["pnl"]
+        points.append({"ts": (r["close_ts"] or "")[:16], "pnl": round(cumulative, 2)})
+    return jsonify(points)
 
 
 @app.route("/api/scan-log")

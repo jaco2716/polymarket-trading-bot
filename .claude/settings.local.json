@@ -14,7 +14,11 @@
       "Bash(curl -s 'https://gamma-api.polymarket.com/markets/1476583')",
       "Bash(grep -r \"^import\\\\|^from\" /Users/welin/Documents/Development/python-projects/polymarket-trading-bot/*.py)",
       "Bash(pip show:*)",
-      "Bash(curl -s \"https://gamma-api.polymarket.com/markets/1476583\")"
+      "Bash(curl -s \"https://gamma-api.polymarket.com/markets/1476583\")",
+      "Bash(find /Users/welin/Documents/Development/python-projects/polymarket-trading-bot -type f \\\\\\(-name *.json -o -name *.sql -o -name *.txt -o -name *.md \\\\\\))",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:docs.polymarket.com)"
     ]
   }
 }

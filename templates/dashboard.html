@@ -21,6 +21,8 @@
     .badge-open { background: rgba(88,166,255,.12); color: #58a6ff; }
     .badge-won  { background: rgba(63,185,80,.12);  color: #3fb950; }
     .badge-lost { background: rgba(248,81,73,.12);  color: #f85149; }
+    .badge-live { background: rgba(227,153,47,.15); color: #e39b2f; }
+    .badge-dry  { background: rgba(139,148,158,.12); color: #8b949e; }
     .tab-active   { border-bottom: 2px solid #58a6ff; color: #e6edf3; }
     .tab-inactive { border-bottom: 2px solid transparent; color: #8b949e; }
     .tab-inactive:hover { color: #c9d1d9; }
@@ -36,8 +38,8 @@
   <header style="background:#161b22;border-bottom:1px solid #21262d"
           class="px-6 py-4 flex items-center justify-between sticky top-0 z-20">
     <div>
-      <h1 class="text-sm font-bold text-white tracking-wide">POLYMARKET PAPER TRADING</h1>
-      <p class="text-xs muted mt-0.5">Paper money only · No real funds at risk</p>
+      <h1 class="text-sm font-bold text-white tracking-wide" id="header-title">POLYMARKET PAPER TRADING</h1>
+      <p class="text-xs muted mt-0.5" id="header-sub">Paper money only · No real funds at risk</p>
     </div>
     <div class="text-right text-xs muted space-y-0.5">
       <div id="last-updated">—</div>
@@ -62,6 +64,8 @@
         <div class="flex">
           <button id="chart-real-btn" onclick="switchChart('real')"
             class="px-4 py-3 text-xs font-semibold tab-active">Real P&amp;L</button>
+          <button id="chart-live-btn" onclick="switchChart('live')"
+            class="px-4 py-3 text-xs font-semibold tab-inactive hidden">Live P&amp;L</button>
           <button id="chart-shadow-btn" onclick="switchChart('shadow')"
             class="px-4 py-3 text-xs font-semibold tab-inactive">Shadow Balance</button>
         </div>
@@ -78,12 +82,15 @@
         <div class="flex">
           <button id="tab-real-btn" onclick="switchTab('real')"
             class="px-4 py-3 text-xs font-semibold tab-active">Real Trades</button>
+          <button id="tab-live-btn" onclick="switchTab('live')"
+            class="px-4 py-3 text-xs font-semibold tab-inactive hidden">Live Trades</button>
           <button id="tab-shadow-btn" onclick="switchTab('shadow')"
             class="px-4 py-3 text-xs font-semibold tab-inactive">Shadow Comparison</button>
         </div>
         <span class="text-xs muted hidden" id="shadow-hint">Set STRATEGY_MODE=shadow to collect data</span>
       </div>
       <div id="tab-real-content"></div>
+      <div id="tab-live-content" class="hidden"></div>
       <div id="tab-shadow-content" class="hidden"></div>
     </div>
 
@@ -95,6 +102,7 @@
           <button onclick="setFilter('all')"      id="f-all"      class="text-xs px-3 py-1 rounded filter-on">All</button>
           <button onclick="setFilter('open')"     id="f-open"     class="text-xs px-3 py-1 rounded filter-off">Open</button>
           <button onclick="setFilter('resolved')" id="f-resolved" class="text-xs px-3 py-1 rounded filter-off">Resolved</button>
+          <button onclick="setFilter('live')"     id="f-live"     class="text-xs px-3 py-1 rounded filter-off hidden">Live</button>
           <button onclick="setFilter('shadow')"   id="f-shadow"   class="text-xs px-3 py-1 rounded filter-off">Shadow</button>
         </div>
         <div id="conf-filters" class="hidden flex gap-1.5">
@@ -155,14 +163,18 @@
 <script>
 let allTrades      = [];
 let shadowTrades   = [];
+let liveTrades     = [];
 let tradeFilter    = 'all';
 let confFilter     = 'all';
 let pnlChart       = null;
 let chartMode      = 'real';
 let cachedRealPnl  = [];
 let cachedShadowPnl = [];
+let cachedLivePnl  = [];
 let startingBudget       = 500;
 let shadowStartingBudget = 500;
+let strategyMode         = 'compete';
+let hasLiveData          = false;
 let refreshInterval      = 60;
 let countdown       = 60;
 let countdownTimer;
@@ -184,7 +196,23 @@ function renderStatCards(ov) {
   const resolvedPnl       = ov.resolved_pnl || 0;
   const shadowResolvedPnl = ov.shadow_resolved_pnl || 0;
 
-  const cards = [
+  const cards = [];
+
+  // Live budget card (shown when live data exists)
+  if (hasLiveData) {
+    const livePnl = ov.live_total_pnl || 0;
+    cards.push({
+      label: 'Live Budget',
+      value: ov.live_budget != null ? `$${ov.live_budget.toFixed(2)}` : '—',
+      valueCls: 'text-yellow-400',
+      sub: `${ov.live_wins || 0}W / ${ov.live_losses || 0}L  ·  ${ov.live_open_trades || 0} open`,
+      subCls: 'muted',
+      sub2: `Live P&L: ${sign(livePnl)}$${Math.abs(livePnl).toFixed(2)}`,
+      sub2Cls: pnlCls(livePnl),
+    });
+  }
+
+  cards.push(
     {
       label: 'Budget',
       value: ov.budget != null ? `$${ov.budget.toFixed(2)}` : '—',
@@ -202,19 +230,16 @@ function renderStatCards(ov) {
       sub2Cls: pnlCls(shadowResolvedPnl),
     },
     {
-      label: 'Total P&L',
-      value: fmtPnl(ov.total_pnl),
-      valueCls: pnlCls(ov.total_pnl),
-      sub: `Fees: $${(ov.total_fees || 0).toFixed(2)}`,
+      label: hasLiveData ? 'Live Win Rate' : 'Win Rate',
+      value: hasLiveData
+        ? (ov.live_resolved_trades > 0 ? `${ov.live_win_rate}%` : '—')
+        : (ov.resolved_trades > 0 ? `${ov.win_rate}%` : '—'),
+      sub: hasLiveData
+        ? `${ov.live_total_trades || 0} live trades  ·  Fees: $${(ov.live_total_fees || 0).toFixed(2)}`
+        : `${ov.wins}W / ${ov.losses}L  ·  ${ov.open_trades} open / ${ov.total_trades} total`,
       subCls: 'muted',
     },
-    {
-      label: 'Win Rate',
-      value: ov.resolved_trades > 0 ? `${ov.win_rate}%` : '—',
-      sub: `${ov.wins}W / ${ov.losses}L  ·  ${ov.open_trades} open / ${ov.total_trades} total`,
-      subCls: 'muted',
-    },
-  ];
+  );
 
   document.getElementById('stat-cards').innerHTML = cards.map(c => `
     <div class="card px-4 py-4">
@@ -281,11 +306,12 @@ function renderStrategyStats(data) {
 }
 
 function switchTab(tab) {
-  const isReal = tab === 'real';
-  document.getElementById('tab-real-content').classList.toggle('hidden', !isReal);
-  document.getElementById('tab-shadow-content').classList.toggle('hidden', isReal);
-  document.getElementById('tab-real-btn').className   = `px-4 py-3 text-xs font-semibold ${isReal ? 'tab-active' : 'tab-inactive'}`;
-  document.getElementById('tab-shadow-btn').className = `px-4 py-3 text-xs font-semibold ${isReal ? 'tab-inactive' : 'tab-active'}`;
+  document.getElementById('tab-real-content').classList.toggle('hidden', tab !== 'real');
+  document.getElementById('tab-live-content').classList.toggle('hidden', tab !== 'live');
+  document.getElementById('tab-shadow-content').classList.toggle('hidden', tab !== 'shadow');
+  document.getElementById('tab-real-btn').className   = `px-4 py-3 text-xs font-semibold ${tab === 'real' ? 'tab-active' : 'tab-inactive'}`;
+  document.getElementById('tab-live-btn').className   = `px-4 py-3 text-xs font-semibold ${tab === 'live' ? 'tab-active' : 'tab-inactive'}`;
+  document.getElementById('tab-shadow-btn').className = `px-4 py-3 text-xs font-semibold ${tab === 'shadow' ? 'tab-active' : 'tab-inactive'}`;
 }
 
 // ── P&L Chart ─────────────────────────────────────────────
@@ -293,15 +319,19 @@ function switchChart(mode) {
   chartMode = mode;
   document.getElementById('chart-real-btn').className =
     `px-4 py-3 text-xs font-semibold ${mode === 'real' ? 'tab-active' : 'tab-inactive'}`;
+  document.getElementById('chart-live-btn').className =
+    `px-4 py-3 text-xs font-semibold ${mode === 'live' ? 'tab-active' : 'tab-inactive'}`;
   document.getElementById('chart-shadow-btn').className =
     `px-4 py-3 text-xs font-semibold ${mode === 'shadow' ? 'tab-active' : 'tab-inactive'}`;
-  drawChart(mode === 'shadow' ? cachedShadowPnl : cachedRealPnl, mode);
+  const pts = mode === 'shadow' ? cachedShadowPnl : mode === 'live' ? cachedLivePnl : cachedRealPnl;
+  drawChart(pts, mode);
 }
 
 function drawChart(points, mode) {
   const canvas  = document.getElementById('pnl-chart');
   const ctx     = canvas.getContext('2d');
   const isShadow = mode === 'shadow';
+  const isLive   = mode === 'live';
   const latest  = points.length ? points[points.length - 1].pnl : null;
 
   // Header value
@@ -311,8 +341,9 @@ function drawChart(points, mode) {
       ? `<span class="${pnlCls(change)}">$${latest.toFixed(2)}</span><span class="text-xs muted ml-2">(${sign(change ?? 0)}$${Math.abs(change ?? 0).toFixed(2)})</span>`
       : '—';
   } else {
+    const label = isLive ? 'Live ' : '';
     document.getElementById('pnl-total').innerHTML =
-      latest != null ? `<span class="${pnlCls(latest)}">${fmtPnl(latest)}</span>` : '—';
+      latest != null ? `<span class="${pnlCls(latest)}">${label}${fmtPnl(latest)}</span>` : '—';
   }
 
   if (pnlChart) { pnlChart.destroy(); pnlChart = null; }
@@ -322,7 +353,8 @@ function drawChart(points, mode) {
     ctx.fillStyle = '#8b949e';
     ctx.font = '12px ui-monospace, monospace';
     ctx.textAlign = 'center';
-    ctx.fillText(isShadow ? 'No resolved shadow trades yet' : 'No resolved trades yet', canvas.width / 2, 80);
+    const emptyMsg = isShadow ? 'No resolved shadow trades yet' : isLive ? 'No resolved live trades yet' : 'No resolved trades yet';
+    ctx.fillText(emptyMsg, canvas.width / 2, 80);
     return;
   }
 
@@ -370,18 +402,20 @@ function drawChart(points, mode) {
   });
 }
 
-function renderPnlChart(realPoints, shadowPoints) {
+function renderPnlChart(realPoints, shadowPoints, livePoints) {
   cachedRealPnl   = realPoints;
   cachedShadowPnl = shadowPoints;
-  drawChart(chartMode === 'shadow' ? shadowPoints : realPoints, chartMode);
+  cachedLivePnl   = livePoints || [];
+  const pts = chartMode === 'shadow' ? shadowPoints : chartMode === 'live' ? cachedLivePnl : realPoints;
+  drawChart(pts, chartMode);
 }
 
 // ── Trades table ──────────────────────────────────────────
 function setFilter(f) {
   tradeFilter = f;
-  ['all', 'open', 'resolved', 'shadow'].forEach(id => {
-    document.getElementById(`f-${id}`).className =
-      `text-xs px-3 py-1 rounded ${f === id ? 'filter-on' : 'filter-off'}`;
+  ['all', 'open', 'resolved', 'live', 'shadow'].forEach(id => {
+    const el = document.getElementById(`f-${id}`);
+    if (el) el.className = `text-xs px-3 py-1 rounded ${f === id ? 'filter-on' : 'filter-off'}`;
   });
   // Show/hide confidence filters and column header
   document.getElementById('conf-filters').classList.toggle('hidden', f !== 'shadow');
@@ -461,16 +495,18 @@ function renderTradesTable() {
     return;
   }
 
-  // Real trades
-  const list = allTrades.filter(t => {
+  // Real + live trades
+  const source = tradeFilter === 'live' ? liveTrades : allTrades;
+  const list = source.filter(t => {
     if (tradeFilter === 'open')     return !t.resolved;
     if (tradeFilter === 'resolved') return  t.resolved;
+    if (tradeFilter === 'live')     return true; // already filtered by source
     return true;
   });
 
   if (list.length === 0) {
     tbody.innerHTML = '';
-    empty.textContent = 'No trades yet';
+    empty.textContent = tradeFilter === 'live' ? 'No live trades yet' : 'No trades yet';
     empty.classList.remove('hidden');
     return;
   }
@@ -481,6 +517,10 @@ function renderTradesTable() {
     try { tags = JSON.parse(t.tags || '[]'); } catch { tags = []; }
     const tagStr = tags.join(', ') || '—';
     const dirBadge = `<span class="badge ${t.direction === 'yes' ? 'badge-yes' : 'badge-no'}">${t.direction.toUpperCase()}</span>`;
+    const isLive = t.mode === 'live' || t.mode === 'live-dry';
+    const modeBadge = isLive
+      ? `<span class="badge ${t.mode === 'live' ? 'badge-live' : 'badge-dry'}">${t.mode === 'live' ? 'LIVE' : 'DRY'}</span> `
+      : '';
     let statusHtml;
     if (!t.resolved) {
       statusHtml = `<span class="badge badge-open">OPEN</span>`;
@@ -492,7 +532,7 @@ function renderTradesTable() {
     return `
       <tr class="row" style="border-top:1px solid #21262d">
         <td class="px-3 py-2 muted">${t.id}</td>
-        <td class="px-3 py-2" style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${t.market_name}">${t.market_name}</td>
+        <td class="px-3 py-2" style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${t.market_name}">${modeBadge}${t.market_name}</td>
         <td class="px-3 py-2 text-center">${dirBadge}</td>
         <td class="px-3 py-2 text-right muted">${t.price != null ? (t.price * 100).toFixed(1) + '%' : '—'}</td>
         <td class="px-3 py-2 text-right">
@@ -531,25 +571,63 @@ function renderScanLog(scans) {
 // ── Fetch & render all ────────────────────────────────────
 async function refresh() {
   try {
-    const [ov, strat, trades, shadow, pnl, shadowPnl, scans] = await Promise.all([
+    const [ov, strat, trades, shadow, live, pnl, shadowPnl, livePnl, scans] = await Promise.all([
       fetch('/api/overview').then(r => r.json()),
       fetch('/api/strategy-stats').then(r => r.json()),
       fetch('/api/trades').then(r => r.json()),
       fetch('/api/shadow-trades').then(r => r.json()),
+      fetch('/api/live-trades').then(r => r.json()),
       fetch('/api/pnl-history').then(r => r.json()),
       fetch('/api/shadow-pnl-history').then(r => r.json()),
+      fetch('/api/live-pnl-history').then(r => r.json()),
       fetch('/api/scan-log').then(r => r.json()),
     ]);
     startingBudget = ov.starting_budget || 500;
     shadowStartingBudget = ov.shadow_starting_budget || startingBudget;
+    strategyMode = ov.strategy_mode || 'compete';
+    hasLiveData = (ov.live_total_trades || 0) > 0 || ov.live_budget != null;
     refreshInterval = Math.min(ov.scan_interval || 3600, 300);
     const shadowPnlPoints = shadowPnl.points || shadowPnl;
+
+    // Update header based on mode
+    if (strategyMode === 'live') {
+      document.getElementById('header-title').textContent = 'POLYMARKET LIVE TRADING';
+      document.getElementById('header-sub').textContent = 'Real funds at risk · CLOB API connected';
+      document.getElementById('header-sub').style.color = '#e39b2f';
+    }
+
+    // Show/hide live UI elements
+    const showLive = hasLiveData || strategyMode === 'live';
+    document.getElementById('chart-live-btn').classList.toggle('hidden', !showLive);
+    document.getElementById('tab-live-btn').classList.toggle('hidden', !showLive);
+    document.getElementById('f-live').classList.toggle('hidden', !showLive);
+
     renderStatCards(ov);
     renderStrategyStats(strat);
     allTrades    = trades;
     shadowTrades = shadow;
+    liveTrades   = live;
+
+    // Build live strategy stats for the live tab
+    if (showLive) {
+      const liveStratMap = {};
+      for (const t of live) {
+        let tags; try { tags = JSON.parse(t.tags || '[]'); } catch { tags = []; }
+        for (const tag of tags) {
+          const s = liveStratMap[tag] || (liveStratMap[tag] = {strategy: tag, open: 0, resolved: 0, wins: 0, pnl: 0});
+          if (t.resolved) { s.resolved++; s.pnl += t.pnl || 0; if ((t.pnl || 0) > 0) s.wins++; }
+          else { s.open++; }
+        }
+      }
+      const liveStrats = Object.values(liveStratMap).map(s => ({
+        ...s, pnl: Math.round(s.pnl * 100) / 100,
+        win_rate: s.resolved > 0 ? Math.round(s.wins / s.resolved * 1000) / 10 : 0,
+      })).sort((a, b) => b.pnl - a.pnl);
+      document.getElementById('tab-live-content').innerHTML = buildStratTable(liveStrats, false);
+    }
+
     renderTradesTable();
-    renderPnlChart(pnl, shadowPnlPoints);
+    renderPnlChart(pnl, shadowPnlPoints, livePnl);
     renderScanLog(scans);
     document.getElementById('last-updated').textContent =
       'Updated ' + new Date().toLocaleTimeString();

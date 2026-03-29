@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """
-Polymarket Automated Paper Trading Bot
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Polymarket Automated Trading Bot
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Runs in the background, scans markets every N minutes,
-and logs simulated paper trades with full P&L tracking.
+and places trades with full P&L tracking.
+
+Modes:
+  shadow   — no real trades; logs hypothetical outcomes for all strategies
+  compete  — paper trades; strategies share 3 slots per scan
+  parallel — paper trades; each strategy places independently
+  live     — REAL trades via Polymarket CLOB API (requires private key)
 
 Strategies:
   1. haiku-analyse  — Claude Haiku checks for positive edge
@@ -11,11 +17,11 @@ Strategies:
   3. whale+haiku    — whale signal confirmed by Haiku before entry
 
 Setup:
-  pip install anthropic requests
+  pip install -r requirements.txt
   export ANTHROPIC_API_KEY="sk-ant-..."
   python polymarket_bot.py
 
-All trades are paper-only. No real money moves.
+For live trading, also set POLYMARKET_PRIVATE_KEY and STRATEGY_MODE=live in .env.
 """
 
 import os, json, re, time, sqlite3, logging, logging.handlers, sys, traceback, random
@@ -93,16 +99,61 @@ CFG = {
         # "0xabc123...",
         # "0xdef456...",
     ],
+
+    # Live trading (CLOB client) — only used when STRATEGY_MODE="live"
+    "POLYMARKET_PRIVATE_KEY":    os.getenv("POLYMARKET_PRIVATE_KEY", ""),
+    "POLYMARKET_FUNDER_ADDRESS": os.getenv("POLYMARKET_FUNDER_ADDRESS", ""),
+    "MAX_LIVE_TRADE_USDC":       float(os.getenv("MAX_LIVE_TRADE_USDC", "50")),
+    "LIVE_MAX_OPEN_TRADES":      int(os.getenv("LIVE_MAX_OPEN_TRADES", "5")),
+    "LIVE_DRY_RUN":              os.getenv("LIVE_DRY_RUN", "true").lower() == "true",
 }
 
 DB_FILE            = "paper_trades.db"
 BUDGET_FILE        = "budget.json"
 SHADOW_BUDGET_FILE = "shadow_budget.json"
+LIVE_BUDGET_FILE   = "live_budget.json"
 
 # API base URLs
 GAMMA_URL = "https://gamma-api.polymarket.com"
 DATA_URL  = "https://data-api.polymarket.com"
 CLOB_URL  = "https://clob.polymarket.com"
+
+# ── CLOB client (live trading) ───────────────────────────────────────────────
+_clob_client = None
+
+def get_clob_client():
+    """Lazy-init singleton for the Polymarket CLOB client."""
+    global _clob_client
+    if _clob_client is not None:
+        return _clob_client
+    if not CFG["POLYMARKET_PRIVATE_KEY"]:
+        raise RuntimeError("POLYMARKET_PRIVATE_KEY not set — cannot trade in live mode")
+    from py_clob_client.client import ClobClient
+    _clob_client = ClobClient(
+        CLOB_URL,
+        key=CFG["POLYMARKET_PRIVATE_KEY"],
+        chain_id=137,
+        signature_type=0,
+        funder=CFG["POLYMARKET_FUNDER_ADDRESS"] or None,
+    )
+    _clob_client.set_api_creds(_clob_client.create_or_derive_api_creds())
+    log.info("CLOB client initialised (Polygon mainnet)")
+    return _clob_client
+
+
+def validate_live_trading_setup():
+    """Pre-flight checks for live trading. Raises on failure."""
+    if not CFG["POLYMARKET_PRIVATE_KEY"]:
+        raise RuntimeError("POLYMARKET_PRIVATE_KEY is required for live trading")
+    get_clob_client()  # eagerly init to catch key/auth errors early
+    # Verify connectivity by fetching a known market
+    try:
+        test = requests.get(f"{CLOB_URL}/markets", params={"limit": 1}, timeout=10)
+        test.raise_for_status()
+    except Exception as e:
+        raise RuntimeError(f"Cannot reach CLOB API: {e}")
+    log.info("Live trading setup validated — CLOB API reachable")
+
 
 # ── Database ──────────────────────────────────────────────────────────────────
 def init_db():
@@ -161,6 +212,12 @@ def init_db():
             con.execute(f"ALTER TABLE shadow_trades ADD COLUMN {col} {definition}")
         except sqlite3.OperationalError:
             pass  # column already exists
+    # Migrate trades table for live trading support
+    for col, definition in [("mode", "TEXT DEFAULT 'paper'"), ("order_id", "TEXT")]:
+        try:
+            con.execute(f"ALTER TABLE trades ADD COLUMN {col} {definition}")
+        except sqlite3.OperationalError:
+            pass
     # Indexes for common queries
     con.execute("CREATE INDEX IF NOT EXISTS idx_trades_resolved ON trades(resolved)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_trades_market_id ON trades(market_id)")
@@ -199,7 +256,25 @@ def save_shadow_budget(b: float):
         json.dump({"budget": round(b, 4)}, f)
     os.replace(tmp, SHADOW_BUDGET_FILE)
 
-def open_trade_count(con) -> int:
+def load_live_budget() -> float:
+    if os.path.exists(LIVE_BUDGET_FILE):
+        with open(LIVE_BUDGET_FILE) as f:
+            return json.load(f)["budget"]
+    b = CFG["STARTING_BUDGET"]
+    save_live_budget(b)
+    return b
+
+def save_live_budget(b: float):
+    tmp = LIVE_BUDGET_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"budget": round(b, 4)}, f)
+    os.replace(tmp, LIVE_BUDGET_FILE)
+
+def open_trade_count(con, mode_filter: str = None) -> int:
+    if mode_filter:
+        return con.execute(
+            "SELECT COUNT(*) FROM trades WHERE resolved=0 AND mode=?", (mode_filter,)
+        ).fetchone()[0]
     return con.execute("SELECT COUNT(*) FROM trades WHERE resolved=0").fetchone()[0]
 
 def open_market_ids(con) -> set:
@@ -315,20 +390,37 @@ def fetch_markets(randomize: bool = False) -> list[dict]:
                         pass  # can't parse date, allow it through
 
             tokens = m.get("tokens") or m.get("clobTokenIds") or []
-            token_id = tokens[0] if tokens else m.get("conditionId")
+            yes_token_id = None
+            no_token_id  = None
+            if tokens:
+                if isinstance(tokens[0], dict):
+                    for t in tokens:
+                        outcome = str(t.get("outcome", "")).lower()
+                        tid = t.get("token_id") or t.get("id", "")
+                        if outcome == "yes":
+                            yes_token_id = tid
+                        elif outcome == "no":
+                            no_token_id = tid
+                elif isinstance(tokens[0], str):
+                    yes_token_id = tokens[0]
+                    no_token_id = tokens[1] if len(tokens) > 1 else None
+            token_id = yes_token_id or m.get("conditionId")
             volume = float(m.get("volume24hr") or m.get("volume") or 0)
 
             pool.append({
-                "id":         m.get("id") or m.get("conditionId", ""),
-                "name":       m.get("question") or m.get("title", "Unknown"),
-                "yes_price":  yes_price,
-                "no_price":   round(1 - yes_price, 4),
-                "liquidity":  liquidity,
-                "volume_24h": volume,
-                "token_id":   token_id,
-                "end_date":   m.get("endDate") or m.get("endDateIso"),
-                "slug":       m.get("slug", ""),
-                "tags":       m.get("tags") or [],
+                "id":            m.get("id") or m.get("conditionId", ""),
+                "name":          m.get("question") or m.get("title", "Unknown"),
+                "yes_price":     yes_price,
+                "no_price":      round(1 - yes_price, 4),
+                "liquidity":     liquidity,
+                "volume_24h":    volume,
+                "token_id":      token_id,
+                "yes_token_id":  yes_token_id,
+                "no_token_id":   no_token_id,
+                "condition_id":  m.get("conditionId") or m.get("condition_id"),
+                "end_date":      m.get("endDate") or m.get("endDateIso"),
+                "slug":          m.get("slug", ""),
+                "tags":          m.get("tags") or [],
             })
         except (TypeError, ValueError, KeyError):
             continue
@@ -367,26 +459,54 @@ def fetch_market_by_id(condition_id: str) -> Optional[dict]:
             return None
         tokens = data.get("tokens") or []
         yes_token = next((t for t in tokens if t.get("outcome", "").lower() == "yes"), None)
+        no_token  = next((t for t in tokens if t.get("outcome", "").lower() == "no"), None)
         if not yes_token:
             return None
         yes_price = float(yes_token.get("price") or 0)
         if yes_price <= 0:
             return None
-        token_id = yes_token.get("token_id")
+        yes_token_id = yes_token.get("token_id")
+        no_token_id  = no_token.get("token_id") if no_token else None
         return {
-            "id":         condition_id,
-            "name":       data.get("question", "Unknown"),
-            "yes_price":  yes_price,
-            "no_price":   round(1 - yes_price, 4),
-            "liquidity":  0.0,   # not available from CLOB endpoint
-            "volume_24h": 0.0,
-            "token_id":   token_id,
-            "end_date":   data.get("end_date_iso"),
-            "slug":       data.get("market_slug", ""),
-            "tags":       data.get("tags") or [],
+            "id":            condition_id,
+            "name":          data.get("question", "Unknown"),
+            "yes_price":     yes_price,
+            "no_price":      round(1 - yes_price, 4),
+            "liquidity":     0.0,   # not available from CLOB endpoint
+            "volume_24h":    0.0,
+            "token_id":      yes_token_id,
+            "yes_token_id":  yes_token_id,
+            "no_token_id":   no_token_id,
+            "condition_id":  condition_id,
+            "end_date":      data.get("end_date_iso"),
+            "slug":          data.get("market_slug", ""),
+            "tags":          data.get("tags") or [],
         }
     except (TypeError, ValueError, KeyError):
         return None
+
+
+def resolve_token_ids(market: dict) -> tuple[Optional[str], Optional[str]]:
+    """Return (yes_token_id, no_token_id) for a market, falling back to CLOB API if needed."""
+    yes_tid = market.get("yes_token_id")
+    no_tid  = market.get("no_token_id")
+    if yes_tid and no_tid:
+        return yes_tid, no_tid
+    # Fallback: query CLOB API by conditionId
+    cid = market.get("condition_id") or market.get("id")
+    if not cid:
+        return yes_tid, no_tid
+    data = get(f"{CLOB_URL}/markets/{cid}")
+    if not data or not isinstance(data, dict):
+        return yes_tid, no_tid
+    for t in (data.get("tokens") or []):
+        outcome = str(t.get("outcome", "")).lower()
+        tid = t.get("token_id")
+        if outcome == "yes" and not yes_tid:
+            yes_tid = tid
+        elif outcome == "no" and not no_tid:
+            no_tid = tid
+    return yes_tid, no_tid
 
 
 def fetch_whale_positions(wallet: str, min_size: float) -> list[dict]:
@@ -739,6 +859,120 @@ def place_paper_trade(
     )
     return new_budget
 
+
+# ── Live trade engine ─────────────────────────────────────────────────────────
+def place_live_trade(
+    con, budget: float,
+    market: dict,
+    direction: str,
+    price: float,
+    order_type: str,
+    tags: list[str],
+    notes: str = "",
+) -> Optional[float]:
+    """
+    Place a real trade on Polymarket via the CLOB API.
+    Returns the new budget, or None if trade was skipped/failed.
+    """
+    live_open = open_trade_count(con, mode_filter="live")
+    if live_open >= CFG["LIVE_MAX_OPEN_TRADES"]:
+        log.info(f"Max live open trades ({CFG['LIVE_MAX_OPEN_TRADES']}) reached — skipping")
+        return None
+
+    amount = round(budget * CFG["TRADE_SIZE_PCT"], 2)
+    amount = max(amount, CFG["MIN_TRADE_USDC"])
+    amount = min(amount, CFG["MAX_LIVE_TRADE_USDC"])  # hard cap
+
+    if amount > budget * 0.95:
+        log.warning(f"Insufficient live budget (${budget:.2f}) for trade of ${amount:.2f}")
+        return None
+
+    # Resolve the correct token_id for the direction
+    yes_tid, no_tid = resolve_token_ids(market)
+    token_id = yes_tid if direction == "yes" else no_tid
+    if not token_id:
+        log.error(f"Cannot resolve {direction} token_id for market {market['id']} — skipping")
+        return None
+
+    fee = calc_fee(amount, price, order_type)
+    new_budget = budget - amount - fee
+
+    # Dry-run mode: log everything but don't call the API
+    if CFG["LIVE_DRY_RUN"]:
+        con.execute("""
+            INSERT INTO trades
+                (ts, market_id, market_name, token_id, direction, price, amount,
+                 fee, order_type, tags, notes, mode)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            datetime.now(timezone.utc).isoformat(),
+            market["id"], market["name"], token_id,
+            direction, price, amount, fee, order_type,
+            json.dumps(tags), notes, "live-dry",
+        ))
+        con.commit()
+        save_live_budget(new_budget)
+        log.info(
+            f"🔸 DRY RUN — would place live trade:\n"
+            f"   Market:   {market['name'][:60]}\n"
+            f"   {direction.upper()} @ {price:.3f}  |  ${amount:.2f}  |  token={token_id[:16]}…\n"
+            f"   Budget:   ${budget:.2f} → ${new_budget:.2f}"
+        )
+        return new_budget
+
+    # Real order placement
+    try:
+        from py_clob_client.clob_types import MarketOrderArgs, OrderType
+        from py_clob_client.order_builder.constants import BUY, SELL
+
+        client = get_clob_client()
+        side = BUY if direction == "yes" else SELL
+
+        mo = MarketOrderArgs(
+            token_id=token_id,
+            amount=amount,
+            side=side,
+        )
+        signed_order = client.create_market_order(mo)
+        resp = client.post_order(signed_order, OrderType.FOK)
+
+        # Extract order ID from response
+        order_id = None
+        if isinstance(resp, dict):
+            order_id = resp.get("orderID") or resp.get("order_id") or resp.get("id")
+        elif hasattr(resp, "orderID"):
+            order_id = resp.orderID
+
+        log.info(
+            f"💰 LIVE trade placed!\n"
+            f"   Market:   {market['name'][:60]}\n"
+            f"   {direction.upper()} @ {price:.3f}  |  ${amount:.2f} staked\n"
+            f"   Order ID: {order_id}\n"
+            f"   Tags:     {', '.join(tags)}\n"
+            f"   Budget:   ${budget:.2f} → ${new_budget:.2f}"
+        )
+
+    except Exception as e:
+        log.error(f"LIVE order FAILED for {market['name'][:50]}: {e}")
+        return None
+
+    # Record in DB
+    con.execute("""
+        INSERT INTO trades
+            (ts, market_id, market_name, token_id, direction, price, amount,
+             fee, order_type, tags, notes, mode, order_id)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        datetime.now(timezone.utc).isoformat(),
+        market["id"], market["name"], token_id,
+        direction, price, amount, fee, order_type,
+        json.dumps(tags), notes, "live", order_id,
+    ))
+    con.commit()
+    save_live_budget(new_budget)
+    return new_budget
+
+
 # ── Shared resolution helper ──────────────────────────────────────────────────
 def get_market_winner(market_id: str) -> Optional[str]:
     """
@@ -808,16 +1042,21 @@ def resolve_settled_trades(con) -> float:
     Returns total P&L from newly resolved trades.
     """
     rows = con.execute(
-        "SELECT id, market_id, direction, price, amount, fee, ts FROM trades WHERE resolved=0"
+        "SELECT id, market_id, direction, price, amount, fee, ts, mode FROM trades WHERE resolved=0"
     ).fetchall()
     if not rows:
         return 0.0
 
     total_pnl = 0.0
-    budget = load_budget()
+    paper_budget = load_budget()
+    live_budget  = load_live_budget() if os.path.exists(LIVE_BUDGET_FILE) else None
+    paper_changed = False
+    live_changed  = False
     now = datetime.now(timezone.utc)
 
-    for row_id, market_id, direction, price, amount, fee, ts in rows:
+    for row in rows:
+        row_id, market_id, direction, price, amount, fee, ts = row[:7]
+        trade_mode = row[7] if len(row) > 7 else "paper"
         # Warn about stale trades
         try:
             age = (now - datetime.fromisoformat(ts)).days
@@ -841,18 +1080,28 @@ def resolve_settled_trades(con) -> float:
         """, (winner, round(pnl, 4), datetime.now(timezone.utc).isoformat(), row_id))
         con.commit()
 
-        budget += amount + fee + pnl
+        # Update the correct budget based on trade mode
+        if trade_mode in ("live", "live-dry"):
+            if live_budget is not None:
+                live_budget += amount + fee + pnl
+                live_changed = True
+        else:
+            paper_budget += amount + fee + pnl
+            paper_changed = True
         total_pnl += pnl
 
+        mode_tag = " [LIVE]" if trade_mode == "live" else ""
         status = "✅ WON" if won else "❌ LOST"
         log.info(
-            f"{status} — resolved trade #{row_id}: {direction.upper()} "
+            f"{status}{mode_tag} — resolved trade #{row_id}: {direction.upper()} "
             f"on market {market_id[:20]}… | P&L: {pnl:+.2f} USDC"
         )
         time.sleep(0.3)
 
-    if total_pnl != 0.0:
-        save_budget(budget)
+    if paper_changed:
+        save_budget(paper_budget)
+    if live_changed and live_budget is not None:
+        save_live_budget(live_budget)
     return total_pnl
 
 # ── Shadow trade engine ───────────────────────────────────────────────────────
@@ -1010,6 +1259,14 @@ def _is_sports_matchup(name: str) -> bool:
     """Return True if the market name looks like a live sports game or spread bet."""
     return any(p in name for p in _SPORTS_PATTERNS)
 
+
+def _place_trade(con, budget, market, direction, price, order_type, tags, notes=""):
+    """Dispatch to live or paper trade placement based on mode."""
+    if CFG["STRATEGY_MODE"] == "live":
+        return place_live_trade(con, budget, market, direction, price, order_type, tags, notes)
+    return place_paper_trade(con, budget, market, direction, price, order_type, tags, notes)
+
+
 def _run_haiku_slot(con, budget: float, markets: list[dict], traded: set,
                     shadow: bool = False) -> tuple[float, int, int]:
     """Run the standalone Haiku strategy. Returns (new_budget, signals, trades)."""
@@ -1022,7 +1279,7 @@ def _run_haiku_slot(con, budget: float, markets: list[dict], traded: set,
         if CFG["HAIKU_SKIP_SPORTS"] and _is_sports_matchup(m["name"]):
             log.debug(f"[haiku-analyse] Skipping sports market: {m['name'][:60]}")
             continue
-        if not shadow and open_trade_count(con) >= CFG["MAX_OPEN_TRADES"]:
+        if not shadow and open_trade_count(con, mode_filter="live" if CFG["STRATEGY_MODE"] == "live" else None) >= (CFG["LIVE_MAX_OPEN_TRADES"] if CFG["STRATEGY_MODE"] == "live" else CFG["MAX_OPEN_TRADES"]):
             break
         analysis = haiku_analyse(m, shadow=shadow)
         time.sleep(0.5)
@@ -1046,7 +1303,7 @@ def _run_haiku_slot(con, budget: float, markets: list[dict], traded: set,
                              confidence=conf, notes=analysis.get("reasoning", ""))
         else:
             otype = analysis.get("order_type", "maker")
-            new_budget = place_paper_trade(
+            new_budget = _place_trade(
                 con, budget, m, dir_, price, otype,
                 tags=["haiku-analyse"], notes=analysis.get("reasoning", ""),
             )
@@ -1096,7 +1353,7 @@ def _run_whale_slot(con, budget: float, whale_signal: Optional[dict], traded: se
         traded.add(m["id"])
         return budget, 1, 1
 
-    new_budget = place_paper_trade(con, budget, m, dir_, price, otype, tags, notes)
+    new_budget = _place_trade(con, budget, m, dir_, price, otype, tags, notes)
     if new_budget is not None:
         traded.add(m["id"])
         return new_budget, 1, 1
@@ -1105,14 +1362,22 @@ def _run_whale_slot(con, budget: float, whale_signal: Optional[dict], traded: se
 
 # ── Main scan loop ─────────────────────────────────────────────────────────────
 def run_scan(con):
-    budget = load_budget()
+    if CFG["STRATEGY_MODE"] == "live":
+        budget = load_live_budget()
+    else:
+        budget = load_budget()
     mode   = CFG["STRATEGY_MODE"]
     log.info(f"\n{'═'*55}\n  🔍 Starting scan  |  Budget: ${budget:.2f}  |  mode={mode}\n{'═'*55}")
 
     resolve_settled_trades(con)
     resolve_shadow_trades(con)
 
-    if mode != "shadow" and open_trade_count(con) >= CFG["MAX_OPEN_TRADES"]:
+    if mode == "live":
+        max_open = CFG["LIVE_MAX_OPEN_TRADES"]
+        if open_trade_count(con, mode_filter="live") >= max_open:
+            log.info(f"At max live open trades ({max_open}) — skipping new entries this scan")
+            return
+    elif mode != "shadow" and open_trade_count(con) >= CFG["MAX_OPEN_TRADES"]:
         log.info("At max open trades — skipping new entries this scan")
         return
 
@@ -1179,7 +1444,7 @@ def run_scan(con):
             signals_found += s; trades_placed += t
 
     else:
-        # ── Compete mode (default): strategies share 3 trade slots ────────────
+        # ── Compete / Live mode: strategies share 3 trade slots ──────────────
         if CFG["ENABLE_WHALE_COPY"] and whale_signal:
             budget, s, t = _run_whale_slot(
                 con, budget, whale_signal, traded_this_scan,
@@ -1200,10 +1465,28 @@ def run_scan(con):
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
+def _load_mode_budget() -> float:
+    """Load the correct budget for the current strategy mode."""
+    mode = CFG["STRATEGY_MODE"]
+    if mode == "shadow":
+        return load_shadow_budget()
+    if mode == "live":
+        return load_live_budget()
+    return load_budget()
+
+
 def main():
-    log.info("━" * 55)
-    log.info("  Polymarket Paper Trading Bot  (paper money only)")
-    log.info("━" * 55)
+    mode = CFG["STRATEGY_MODE"]
+    if mode == "live":
+        log.info("━" * 55)
+        log.info("  Polymarket Trading Bot  — LIVE MODE (REAL MONEY)")
+        log.info("━" * 55)
+        if CFG["LIVE_DRY_RUN"]:
+            log.info("  Dry-run enabled — orders logged but NOT placed")
+    else:
+        log.info("━" * 55)
+        log.info("  Polymarket Paper Trading Bot  (paper money only)")
+        log.info("━" * 55)
 
     if not CFG["ANTHROPIC_API_KEY"] and CFG["ENABLE_HAIKU"]:
         log.error("ANTHROPIC_API_KEY not set. Run: export ANTHROPIC_API_KEY='sk-ant-...'")
@@ -1219,35 +1502,43 @@ def main():
         errors.append(f"STARTING_BUDGET must be positive, got {CFG['STARTING_BUDGET']}")
     if CFG["SCAN_INTERVAL"] < 60:
         errors.append(f"SCAN_INTERVAL must be >= 60 seconds, got {CFG['SCAN_INTERVAL']}")
-    if CFG["STRATEGY_MODE"] not in ("compete", "parallel", "shadow"):
-        errors.append(f"STRATEGY_MODE must be compete|parallel|shadow, got '{CFG['STRATEGY_MODE']}'")
+    if CFG["STRATEGY_MODE"] not in ("compete", "parallel", "shadow", "live"):
+        errors.append(f"STRATEGY_MODE must be compete|parallel|shadow|live, got '{CFG['STRATEGY_MODE']}'")
     if errors:
         for e in errors:
             log.error(f"Config error: {e}")
         sys.exit(1)
 
+    # Live trading pre-flight
+    if mode == "live":
+        try:
+            validate_live_trading_setup()
+        except RuntimeError as e:
+            log.error(f"Live trading setup failed: {e}")
+            sys.exit(1)
+
     con = init_db()
     try:
-        budget = load_budget()
+        budget = _load_mode_budget()
         log.info(f"Starting budget: ${budget:.2f} USDC")
-        log.info(f"Strategies: haiku={CFG['ENABLE_HAIKU']}, whale_copy={CFG['ENABLE_WHALE_COPY']}, mode={CFG['STRATEGY_MODE']}")
-        interval_display = CFG["SHADOW_SCAN_INTERVAL"] if CFG["STRATEGY_MODE"] == "shadow" else CFG["SCAN_INTERVAL"]
-        log.info(f"Scan interval: {interval_display}s  |  Max open trades: {CFG['MAX_OPEN_TRADES']}")
+        log.info(f"Strategies: haiku={CFG['ENABLE_HAIKU']}, whale_copy={CFG['ENABLE_WHALE_COPY']}, mode={mode}")
+        max_open = CFG["LIVE_MAX_OPEN_TRADES"] if mode == "live" else CFG["MAX_OPEN_TRADES"]
+        interval_display = CFG["SHADOW_SCAN_INTERVAL"] if mode == "shadow" else CFG["SCAN_INTERVAL"]
+        log.info(f"Scan interval: {interval_display}s  |  Max open trades: {max_open}")
         log.info(f"Trade size: {CFG['TRADE_SIZE_PCT']*100:.0f}% of budget per trade (~${budget*CFG['TRADE_SIZE_PCT']:.2f})")
+        if mode == "live":
+            log.info(f"Live hard cap: ${CFG['MAX_LIVE_TRADE_USDC']:.2f} per trade  |  Dry run: {CFG['LIVE_DRY_RUN']}")
 
         scan_count = 0
         while True:
             try:
                 # Check if budget is too low to place trades
-                if CFG["STRATEGY_MODE"] == "shadow":
-                    current_budget = load_shadow_budget()
-                else:
-                    current_budget = load_budget()
+                current_budget = _load_mode_budget()
                 trade_amount = current_budget * CFG["TRADE_SIZE_PCT"]
 
                 if trade_amount < CFG["MIN_TRADE_USDC"]:
                     cooldown = CFG["LOW_BUDGET_COOLDOWN"]
-                    interval = CFG["SHADOW_SCAN_INTERVAL"] if CFG["STRATEGY_MODE"] == "shadow" else CFG["SCAN_INTERVAL"]
+                    interval = CFG["SHADOW_SCAN_INTERVAL"] if mode == "shadow" else CFG["SCAN_INTERVAL"]
                     log.info(
                         f"Budget too low for new trades (${current_budget:.2f}, "
                         f"trade size ${trade_amount:.2f} < ${CFG['MIN_TRADE_USDC']:.2f}) "
@@ -1257,11 +1548,7 @@ def main():
                     while elapsed < cooldown:
                         resolve_settled_trades(con)
                         resolve_shadow_trades(con)
-                        # Check if budget has recovered enough to resume
-                        if CFG["STRATEGY_MODE"] == "shadow":
-                            current_budget = load_shadow_budget()
-                        else:
-                            current_budget = load_budget()
+                        current_budget = _load_mode_budget()
                         if current_budget * CFG["TRADE_SIZE_PCT"] >= CFG["MIN_TRADE_USDC"]:
                             log.info(f"Budget recovered to ${current_budget:.2f} — resuming scans")
                             break
@@ -1280,7 +1567,7 @@ def main():
             except Exception:
                 log.error(f"Scan error:\n{traceback.format_exc()}")
 
-            interval = CFG["SHADOW_SCAN_INTERVAL"] if CFG["STRATEGY_MODE"] == "shadow" else CFG["SCAN_INTERVAL"]
+            interval = CFG["SHADOW_SCAN_INTERVAL"] if mode == "shadow" else CFG["SCAN_INTERVAL"]
             log.info(f"Sleeping {interval}s until next scan...")
             time.sleep(interval)
     finally:
