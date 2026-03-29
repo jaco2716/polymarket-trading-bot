@@ -51,20 +51,19 @@ CFG = {
 
     # Market filters
     "MIN_LIQUIDITY":      float(os.getenv("MIN_LIQUIDITY",    "2000")),  # skip thin markets
-    "PRICE_MIN":          float(os.getenv("PRICE_MIN",        "0.10")),  # skip extreme longshots
-    "PRICE_MAX":          float(os.getenv("PRICE_MAX",        "0.90")),
-    "MAX_TRADE_PRICE":    float(os.getenv("MAX_TRADE_PRICE",  "0.85")),  # skip near-certain outcomes (tiny payout)
+    "MAX_TRADE_PRICE":    float(os.getenv("MAX_TRADE_PRICE",  "0.85")),  # skip near-certain outcomes; forces yes/no into [0.15, 0.85]
     "MAX_RESOLVE_HOURS":  float(os.getenv("MAX_RESOLVE_HOURS", "0")),    # 0 = no limit; set e.g. 24 for same-day markets only
     "MARKET_POOL_SIZE":   int(os.getenv("MARKET_POOL_SIZE",   "100")),   # fetch this many, then rank and pick best
     "MARKETS_PER_SCAN":   int(os.getenv("MARKETS_PER_SCAN",   "20")),    # top N to send to Haiku after ranking
 
     # Strategies
-    "ENABLE_HAIKU":       os.getenv("ENABLE_HAIKU",       "true").lower() == "true",
-    "ENABLE_WHALE_COPY":  os.getenv("ENABLE_WHALE_COPY",  "true").lower() == "true",
-    "HAIKU_MIN_CONF":        float(os.getenv("HAIKU_MIN_CONF",        "0.65")),  # confidence threshold for real trades
-    "SHADOW_HAIKU_MIN_CONF": float(os.getenv("SHADOW_HAIKU_MIN_CONF", "0.35")),  # lower threshold for shadow data collection
-    "WHALE_MIN_SIZE":     float(os.getenv("WHALE_MIN_SIZE",   "500")),   # min USD for whale trade
-    "WHALE_LOOKBACK_MIN": int(os.getenv("WHALE_LOOKBACK_MIN", "30")),    # minutes to look back
+    "ENABLE_HAIKU":           os.getenv("ENABLE_HAIKU",       "true").lower() == "true",
+    "ENABLE_WHALE_COPY":      os.getenv("ENABLE_WHALE_COPY",  "true").lower() == "true",
+    "HAIKU_MIN_CONF":         float(os.getenv("HAIKU_MIN_CONF",        "0.65")),  # confidence threshold for real trades
+    "SHADOW_HAIKU_MIN_CONF":  float(os.getenv("SHADOW_HAIKU_MIN_CONF", "0.35")),  # lower threshold for shadow data collection
+    "HAIKU_SKIP_SPORTS":      os.getenv("HAIKU_SKIP_SPORTS", "true").lower() == "true",  # block game matchups/spreads
+    "WHALE_MIN_SIZE":         float(os.getenv("WHALE_MIN_SIZE",   "500")),   # min USD for whale trade
+    "WHALE_LOOKBACK_MIN":     int(os.getenv("WHALE_LOOKBACK_MIN", "30")),    # minutes to look back
 
     # Limits
     "MAX_OPEN_TRADES":    int(os.getenv("MAX_OPEN_TRADES", "10")),
@@ -178,6 +177,11 @@ def open_market_ids(con) -> set:
     rows = con.execute("SELECT market_id FROM trades WHERE resolved=0").fetchall()
     return {r[0] for r in rows}
 
+def open_shadow_market_ids(con) -> set:
+    """Return market IDs that already have an open (unresolved) shadow trade."""
+    rows = con.execute("SELECT market_id FROM shadow_trades WHERE resolved=0").fetchall()
+    return {r[0] for r in rows}
+
 # ── Fee calculation ───────────────────────────────────────────────────────────
 def calc_fee(amount: float, price: float, order_type: str = "taker") -> float:
     """
@@ -247,10 +251,9 @@ def fetch_markets(randomize: bool = False) -> list[dict]:
 
             if yes_price is None:
                 continue
-            if not (CFG["PRICE_MIN"] <= yes_price <= CFG["PRICE_MAX"]):
-                continue
 
-            # Skip if both sides exceed MAX_TRADE_PRICE (near-certain outcome, tiny payout)
+            # Skip near-certain outcomes — tiny payout, high price risk.
+            # MAX_TRADE_PRICE=0.85 enforces both sides into [0.15, 0.85].
             no_price = round(1 - yes_price, 4)
             if max(yes_price, no_price) > CFG["MAX_TRADE_PRICE"]:
                 continue
@@ -466,14 +469,21 @@ def get_whale_signal(markets: list[dict]) -> Optional[dict]:
                 m = fetch_market_by_id(pos["market_id"])
                 if m is None:
                     continue
+            signal_price = m["yes_price"] if pos["direction"] == "yes" else m["no_price"]
+            if signal_price > CFG["MAX_TRADE_PRICE"]:
+                log.debug(
+                    f"🐋 Skipping whale position (price {signal_price:.3f} > MAX_TRADE_PRICE): "
+                    f"{m['name'][:50]}"
+                )
+                continue
             log.info(
                 f"🐋 Whale position: {wallet[:10]}… "
-                f"{pos['direction'].upper()} on '{m['name'][:50]}' (holding ${pos['size']:.0f})"
+                f"{pos['direction'].upper()} on '{m['name'][:50]}' @ {signal_price:.3f} (holding ${pos['size']:.0f})"
             )
             return {
                 "market":     m,
                 "direction":  pos["direction"],
-                "price":      m["yes_price"] if pos["direction"] == "yes" else m["no_price"],
+                "price":      signal_price,
                 "signal":     "whale-copy",
                 "whale":      wallet,
                 "whale_size": pos["size"],
@@ -530,13 +540,16 @@ Reply ONLY with valid JSON — no prose, no markdown fences:
   "edge": true | false,
   "direction": "yes" | "no",
   "confidence": 0.0-1.0,
-  "reasoning": "one sentence max",
+  "reasoning": "one sentence citing the specific fact that justifies the edge",
   "order_type": "maker" | "taker"
 }
 
-Lean toward "edge: false" unless you see a clear mispricing.
-Prefer "maker" orders (limit orders) to save on fees.
-Only say edge:true if confidence >= 0.60."""
+Rules:
+- Only say edge:true if you can cite a SPECIFIC piece of news or data showing the market is mispriced.
+- "No clear signal", "market appears efficient", or "insufficient information" means edge:false, not edge:true.
+- Do not have a directional bias — evaluate YES and NO equally based on evidence alone.
+- Only say edge:true if confidence >= 0.60.
+- Prefer "maker" orders (limit orders) to save on fees."""
 
 def _haiku_system_shadow() -> str:
     threshold = CFG["SHADOW_HAIKU_MIN_CONF"]
@@ -547,12 +560,15 @@ Reply ONLY with valid JSON — no prose, no markdown fences:
   "edge": true | false,
   "direction": "yes" | "no",
   "confidence": 0.0-1.0,
-  "reasoning": "one sentence max",
+  "reasoning": "one sentence citing the specific fact or signal behind your view",
   "order_type": "maker" | "taker"
 }}
 
-Be willing to say edge:true whenever confidence >= {threshold} — this is a data collection run, not live trading.
-Prefer "maker" orders (limit orders) to save on fees."""
+Rules:
+- Say edge:true whenever confidence >= {threshold} — this is data collection, not live trading.
+- Do not have a directional bias — evaluate YES and NO equally based on evidence alone.
+- Always give your honest best-guess direction even when uncertain; we want to learn which signals work.
+- Prefer "maker" orders (limit orders) to save on fees."""
 
 def haiku_analyse(market: dict, shadow: bool = False) -> Optional[dict]:
     """Ask Claude Haiku if a market has a tradeable edge."""
@@ -879,6 +895,12 @@ def print_stats(con):
             log.info(f"    [{strategy}]  {total} evaluated  wr={wr}  hypothetical P&L={spnl:+.2f}")
 
 # ── Shared strategy helpers ────────────────────────────────────────────────────
+_SPORTS_PATTERNS = ("Spread:", " vs. ", "O/U ", ": O/U")
+
+def _is_sports_matchup(name: str) -> bool:
+    """Return True if the market name looks like a live sports game or spread bet."""
+    return any(p in name for p in _SPORTS_PATTERNS)
+
 def _run_haiku_slot(con, budget: float, markets: list[dict], traded: set,
                     shadow: bool = False) -> tuple[float, int, int]:
     """Run the standalone Haiku strategy. Returns (new_budget, signals, trades)."""
@@ -886,6 +908,9 @@ def _run_haiku_slot(con, budget: float, markets: list[dict], traded: set,
     log.info(f"[haiku-analyse] Scanning top {min(10, len(markets))} markets...")
     for m in markets[:10]:
         if m["id"] in traded:
+            continue
+        if CFG["HAIKU_SKIP_SPORTS"] and _is_sports_matchup(m["name"]):
+            log.debug(f"[haiku-analyse] Skipping sports market: {m['name'][:60]}")
             continue
         if not shadow and open_trade_count(con) >= CFG["MAX_OPEN_TRADES"]:
             break
@@ -988,11 +1013,10 @@ def run_scan(con):
 
     signals_found = 0
     trades_placed = 0
-    # In real modes, pre-seed with markets that already have an open trade
-    # so we never open a second position on the same market.
-    # Shadow mode is unrestricted — contradictory signals are useful data.
+    # Pre-seed with markets that already have an open trade so we never
+    # open a second position on the same market.
     if mode == "shadow":
-        traded_this_scan: set = set()
+        traded_this_scan: set = open_shadow_market_ids(con)
     else:
         traded_this_scan: set = open_market_ids(con)
 
@@ -1008,6 +1032,12 @@ def run_scan(con):
     if mode == "shadow":
         # ── Shadow mode: evaluate all 3 strategies, log hypothetical trades ──
         # No budget is spent. Use results to compare strategies over time.
+        # traded_this_scan is seeded with already-open shadow trades so we don't
+        # double-enter the same position across scans.
+        # whale+haiku uses the pre-scan snapshot so it can still compare against
+        # the same market whale-copy just traded this scan (useful A/B data).
+        pre_scan_traded = set(traded_this_scan)
+
         if CFG["ENABLE_HAIKU"]:
             _, s, t = _run_haiku_slot(con, budget, markets, traded_this_scan, shadow=True)
             signals_found += s; trades_placed += t
@@ -1018,7 +1048,7 @@ def run_scan(con):
             signals_found += s; trades_placed += t
 
         if CFG["ENABLE_WHALE_COPY"] and CFG["ENABLE_HAIKU"]:
-            _, s, t = _run_whale_slot(con, budget, whale_signal, set(),
+            _, s, t = _run_whale_slot(con, budget, whale_signal, pre_scan_traded,
                                       confirm_with_haiku=True, shadow=True)
             signals_found += s; trades_placed += t
 
