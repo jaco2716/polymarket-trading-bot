@@ -139,16 +139,17 @@ def init_db():
             direction   TEXT    NOT NULL,
             price       REAL    NOT NULL,
             amount      REAL    NOT NULL,   -- hypothetical stake (no real budget impact)
+            fee         REAL,               -- estimated taker fee (for apples-to-apples P&L vs real trades)
             confidence  REAL,               -- haiku confidence score (NULL for whale-copy)
             notes       TEXT,               -- reasoning: haiku explanation or whale context
             resolved    INTEGER DEFAULT 0,
             outcome     TEXT,
-            pnl         REAL,
+            pnl         REAL,               -- realised P&L after fee
             close_ts    TEXT
         )
     """)
     # Migrate existing shadow_trades table if columns are missing
-    for col, definition in [("confidence", "REAL"), ("notes", "TEXT")]:
+    for col, definition in [("confidence", "REAL"), ("notes", "TEXT"), ("fee", "REAL")]:
         try:
             con.execute(f"ALTER TABLE shadow_trades ADD COLUMN {col} {definition}")
         except sqlite3.OperationalError:
@@ -783,10 +784,11 @@ def log_shadow_trade(con, strategy: str, market: dict, direction: str, price: fl
                      confidence: Optional[float] = None, notes: Optional[str] = None):
     """Record a hypothetical trade with no budget impact."""
     amount = round(CFG["STARTING_BUDGET"] * CFG["TRADE_SIZE_PCT"], 2)
+    fee = calc_fee(amount, price)
     con.execute("""
         INSERT INTO shadow_trades
-            (ts, strategy, market_id, market_name, direction, price, amount, confidence, notes)
-        VALUES (?,?,?,?,?,?,?,?,?)
+            (ts, strategy, market_id, market_name, direction, price, amount, fee, confidence, notes)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
     """, (
         datetime.now(timezone.utc).isoformat(),
         strategy,
@@ -795,6 +797,7 @@ def log_shadow_trade(con, strategy: str, market: dict, direction: str, price: fl
         direction,
         price,
         amount,
+        fee,
         confidence,
         notes,
     ))
@@ -808,18 +811,18 @@ def log_shadow_trade(con, strategy: str, market: dict, direction: str, price: fl
 def resolve_shadow_trades(con):
     """Check open shadow trades against market outcomes and record hypothetical P&L."""
     rows = con.execute(
-        "SELECT id, market_id, direction, price, amount FROM shadow_trades WHERE resolved=0"
+        "SELECT id, market_id, direction, price, amount, fee FROM shadow_trades WHERE resolved=0"
     ).fetchall()
     if not rows:
         return
 
-    for row_id, market_id, direction, price, amount in rows:
+    for row_id, market_id, direction, price, amount, fee in rows:
         winner = get_market_winner(market_id)
         if not winner:
             continue
 
         won = (direction == winner)
-        pnl = amount * (1 - price) / price if won else -amount
+        pnl = (amount * (1 - price) / price if won else -amount) - (fee or 0)
 
         con.execute("""
             UPDATE shadow_trades SET resolved=1, outcome=?, pnl=?, close_ts=? WHERE id=?

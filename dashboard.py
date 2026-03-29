@@ -108,19 +108,21 @@ def strategy_stats():
                COUNT(*)                                       AS total,
                SUM(CASE WHEN resolved=1 THEN 1 ELSE 0 END)   AS resolved,
                SUM(CASE WHEN pnl > 0   THEN 1 ELSE 0 END)    AS wins,
-               ROUND(SUM(COALESCE(pnl, 0)), 2)                AS pnl
+               ROUND(SUM(COALESCE(pnl, 0)), 2)                AS pnl,
+               ROUND(SUM(COALESCE(fee, 0)), 4)                AS total_fees
         FROM shadow_trades GROUP BY strategy
     """)
     shadow = []
     for r in shadow_rows:
         res = r.get("resolved") or 0
         shadow.append({
-            "strategy": r["strategy"],
-            "total":    r["total"],
-            "resolved": res,
-            "wins":     r.get("wins") or 0,
-            "pnl":      r.get("pnl") or 0,
-            "win_rate": round((r.get("wins") or 0) / res * 100, 1) if res else 0,
+            "strategy":    r["strategy"],
+            "total":       r["total"],
+            "resolved":    res,
+            "wins":        r.get("wins") or 0,
+            "pnl":         r.get("pnl") or 0,
+            "total_fees":  r.get("total_fees") or 0,
+            "win_rate":    round((r.get("wins") or 0) / res * 100, 1) if res else 0,
         })
     shadow.sort(key=lambda x: -(x["pnl"] or 0))
 
@@ -139,7 +141,7 @@ def trades():
 @app.route("/api/shadow-trades")
 def shadow_trades():
     return jsonify(db_query("""
-        SELECT id, ts, strategy, market_name, direction, price, amount,
+        SELECT id, ts, strategy, market_name, direction, price, amount, fee,
                resolved, outcome, pnl, close_ts, confidence, notes
         FROM shadow_trades ORDER BY id DESC LIMIT 200
     """))

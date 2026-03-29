@@ -223,15 +223,18 @@ function buildStratTable(rows, shadow) {
     </div>`;
   }
   const colOpen = shadow ? `<th class="px-4 py-2 text-right">Evaluated</th>` : `<th class="px-4 py-2 text-right">Open</th>`;
+  const feesCol = shadow ? `<th class="px-4 py-2 text-right">Est. Fees</th>` : '';
   const rowsHtml = rows.map(r => {
     const openVal = shadow ? r.total : r.open;
     const wr = r.resolved > 0 ? `${r.win_rate}%` : '<span class="muted">—</span>';
+    const feesCell = shadow ? `<td class="px-4 py-2.5 text-right muted">$${(r.total_fees || 0).toFixed(3)}</td>` : '';
     return `
       <tr class="row" style="border-top:1px solid #21262d">
         <td class="px-4 py-2.5 font-semibold text-white">${r.strategy}</td>
         <td class="px-4 py-2.5 text-right muted">${openVal}</td>
         <td class="px-4 py-2.5 text-right muted">${r.resolved}</td>
         <td class="px-4 py-2.5 text-right">${wr}</td>
+        ${feesCell}
         <td class="px-4 py-2.5 text-right font-semibold ${pnlCls(r.pnl)}">${fmtPnl(r.pnl)}</td>
       </tr>
     `;
@@ -244,6 +247,7 @@ function buildStratTable(rows, shadow) {
           ${colOpen}
           <th class="px-4 py-2 text-right">Resolved</th>
           <th class="px-4 py-2 text-right">Win Rate</th>
+          ${feesCol}
           <th class="px-4 py-2 text-right">${shadow ? 'Hypothetical P&L' : 'P&L'}</th>
         </tr>
       </thead>
@@ -430,7 +434,10 @@ function renderTradesTable() {
           <td class="px-3 py-2" style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${t.notes ? t.market_name + ' — ' + t.notes : t.market_name}">${t.market_name}</td>
           <td class="px-3 py-2 text-center">${dirBadge}</td>
           <td class="px-3 py-2 text-right muted">${(t.price * 100).toFixed(1)}%</td>
-          <td class="px-3 py-2 text-right muted">$${t.amount.toFixed(2)}</td>
+          <td class="px-3 py-2 text-right muted">
+            $${t.amount.toFixed(2)}
+            ${t.fee != null ? `<div class="text-xs" style="color:#6e7681">fee ${(t.fee).toFixed(3)}</div>` : ''}
+          </td>
           <td class="px-3 py-2 muted">${t.strategy}</td>
           <td class="px-3 py-2 text-center">${confHtml}</td>
           <td class="px-3 py-2 text-center">${statusHtml}</td>
