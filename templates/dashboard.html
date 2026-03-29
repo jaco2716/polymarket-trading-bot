@@ -57,12 +57,19 @@
     </div>
 
     <!-- ── P&L Chart ── -->
-    <div class="card p-4">
-      <div class="flex items-center justify-between mb-3">
-        <h2 class="text-xs font-semibold muted uppercase tracking-wider">Cumulative P&amp;L</h2>
+    <div class="card overflow-hidden">
+      <div style="border-bottom:1px solid #21262d" class="flex items-center justify-between pr-4">
+        <div class="flex">
+          <button id="chart-real-btn" onclick="switchChart('real')"
+            class="px-4 py-3 text-xs font-semibold tab-active">Real P&amp;L</button>
+          <button id="chart-shadow-btn" onclick="switchChart('shadow')"
+            class="px-4 py-3 text-xs font-semibold tab-inactive">Shadow Balance</button>
+        </div>
         <span id="pnl-total" class="text-lg font-bold text-white">—</span>
       </div>
-      <div style="height:160px"><canvas id="pnl-chart"></canvas></div>
+      <div class="p-4">
+        <div style="height:160px"><canvas id="pnl-chart"></canvas></div>
+      </div>
     </div>
 
     <!-- ── Strategy comparison ── -->
@@ -146,12 +153,15 @@
   </main>
 
 <script>
-let allTrades    = [];
-let shadowTrades = [];
-let tradeFilter  = 'all';
-let confFilter   = 'all';
-let pnlChart    = null;
-let countdown   = 60;
+let allTrades      = [];
+let shadowTrades   = [];
+let tradeFilter    = 'all';
+let confFilter     = 'all';
+let pnlChart       = null;
+let chartMode      = 'real';
+let cachedRealPnl  = [];
+let cachedShadowPnl = [];
+let countdown      = 60;
 let countdownTimer;
 
 // ── Formatters ────────────────────────────────────────────
@@ -262,42 +272,63 @@ function switchTab(tab) {
 }
 
 // ── P&L Chart ─────────────────────────────────────────────
-function renderPnlChart(points) {
-  const canvas = document.getElementById('pnl-chart');
-  const ctx    = canvas.getContext('2d');
-  const latest = points.length ? points[points.length - 1].pnl : null;
+function switchChart(mode) {
+  chartMode = mode;
+  document.getElementById('chart-real-btn').className =
+    `px-4 py-3 text-xs font-semibold ${mode === 'real' ? 'tab-active' : 'tab-inactive'}`;
+  document.getElementById('chart-shadow-btn').className =
+    `px-4 py-3 text-xs font-semibold ${mode === 'shadow' ? 'tab-active' : 'tab-inactive'}`;
+  drawChart(mode === 'shadow' ? cachedShadowPnl : cachedRealPnl, mode);
+}
 
-  document.getElementById('pnl-total').innerHTML =
-    latest != null ? `<span class="${pnlCls(latest)}">${fmtPnl(latest)}</span>` : '—';
+function drawChart(points, mode) {
+  const canvas  = document.getElementById('pnl-chart');
+  const ctx     = canvas.getContext('2d');
+  const isShadow = mode === 'shadow';
+  const latest  = points.length ? points[points.length - 1].pnl : null;
+
+  // Header value
+  if (isShadow) {
+    const starting = 500;
+    const change = latest != null ? latest - starting : null;
+    document.getElementById('pnl-total').innerHTML = latest != null
+      ? `<span class="${pnlCls(change)}">$${latest.toFixed(2)}</span><span class="text-xs muted ml-2">(${sign(change ?? 0)}$${Math.abs(change ?? 0).toFixed(2)})</span>`
+      : '—';
+  } else {
+    document.getElementById('pnl-total').innerHTML =
+      latest != null ? `<span class="${pnlCls(latest)}">${fmtPnl(latest)}</span>` : '—';
+  }
 
   if (pnlChart) { pnlChart.destroy(); pnlChart = null; }
 
-  if (points.length === 0) {
+  if (points.length <= 1) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.fillStyle = '#8b949e';
     ctx.font = '12px ui-monospace, monospace';
     ctx.textAlign = 'center';
-    ctx.fillText('No resolved trades yet', canvas.width / 2, 80);
+    ctx.fillText(isShadow ? 'No resolved shadow trades yet' : 'No resolved trades yet', canvas.width / 2, 80);
     return;
   }
 
-  const color = (latest ?? 0) >= 0 ? '#3fb950' : '#f85149';
-  const grad  = ctx.createLinearGradient(0, 0, 0, 160);
+  const refVal  = isShadow ? 500 : 0;
+  const color   = (latest ?? refVal) >= refVal ? '#3fb950' : '#f85149';
+  const grad    = ctx.createLinearGradient(0, 0, 0, 160);
   grad.addColorStop(0, color + '40');
   grad.addColorStop(1, color + '00');
 
   pnlChart = new Chart(ctx, {
     type: 'line',
     data: {
-      labels: points.map(p => p.ts),
+      labels: points.map(p => p.ts || 'Start'),
       datasets: [{
-        data: points.map(p => p.pnl),
-        borderColor: color,
+        data:            points.map(p => p.pnl),
+        borderColor:     color,
         backgroundColor: grad,
-        fill: true,
-        tension: 0.35,
-        pointRadius: points.length > 40 ? 0 : 3,
+        fill:            true,
+        tension:         0.35,
+        pointRadius:     points.length > 40 ? 0 : 3,
         pointHoverRadius: 5,
-        borderWidth: 2,
+        borderWidth:     2,
       }]
     },
     options: {
@@ -312,7 +343,7 @@ function renderPnlChart(points) {
           borderWidth: 1,
           titleColor: '#8b949e',
           bodyColor: '#e6edf3',
-          callbacks: { label: c => ` ${fmtPnl(c.raw)}` }
+          callbacks: { label: c => isShadow ? ` $${c.raw.toFixed(2)}` : ` ${fmtPnl(c.raw)}` }
         }
       },
       scales: {
@@ -321,6 +352,12 @@ function renderPnlChart(points) {
       }
     }
   });
+}
+
+function renderPnlChart(realPoints, shadowPoints) {
+  cachedRealPnl   = realPoints;
+  cachedShadowPnl = shadowPoints;
+  drawChart(chartMode === 'shadow' ? shadowPoints : realPoints, chartMode);
 }
 
 // ── Trades table ──────────────────────────────────────────
@@ -470,12 +507,13 @@ function renderScanLog(scans) {
 // ── Fetch & render all ────────────────────────────────────
 async function refresh() {
   try {
-    const [ov, strat, trades, shadow, pnl, scans] = await Promise.all([
+    const [ov, strat, trades, shadow, pnl, shadowPnl, scans] = await Promise.all([
       fetch('/api/overview').then(r => r.json()),
       fetch('/api/strategy-stats').then(r => r.json()),
       fetch('/api/trades').then(r => r.json()),
       fetch('/api/shadow-trades').then(r => r.json()),
       fetch('/api/pnl-history').then(r => r.json()),
+      fetch('/api/shadow-pnl-history').then(r => r.json()),
       fetch('/api/scan-log').then(r => r.json()),
     ]);
     renderStatCards(ov);
@@ -483,7 +521,7 @@ async function refresh() {
     allTrades    = trades;
     shadowTrades = shadow;
     renderTradesTable();
-    renderPnlChart(pnl);
+    renderPnlChart(pnl, shadowPnl);
     renderScanLog(scans);
     document.getElementById('last-updated').textContent =
       'Updated ' + new Date().toLocaleTimeString();

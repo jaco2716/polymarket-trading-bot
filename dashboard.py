@@ -160,6 +160,22 @@ def pnl_history():
     return jsonify(points)
 
 
+@app.route("/api/shadow-pnl-history")
+def shadow_pnl_history():
+    starting = 500.0
+    rows = db_query("""
+        SELECT close_ts, pnl FROM shadow_trades
+        WHERE resolved=1 AND pnl IS NOT NULL
+        ORDER BY close_ts ASC
+    """)
+    balance = starting
+    points = [{"ts": None, "pnl": round(balance, 2)}]
+    for r in rows:
+        balance += r["pnl"]
+        points.append({"ts": (r["close_ts"] or "")[:16], "pnl": round(balance, 2)})
+    return jsonify(points)
+
+
 @app.route("/api/scan-log")
 def scan_log():
     return jsonify(db_query("""

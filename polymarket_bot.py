@@ -449,11 +449,16 @@ def get_whale_signal(markets: list[dict]) -> Optional[dict]:
         log.info("Leaderboard unavailable — skipping whale strategy this scan")
         return None
 
-    log.info(f"Scanning global trade feed for activity from {len(profitable)} profitable wallets...")
+    log.info(f"Scanning global trade feed for activity from {len(profitable)} profitable wallets... (min size=${CFG['WHALE_MIN_SIZE']:.0f}, lookback={CFG['WHALE_LOOKBACK_MIN']}min)")
     recent_trades = fetch_global_recent_trades(CFG["WHALE_MIN_SIZE"], CFG["WHALE_LOOKBACK_MIN"])
 
     if recent_trades:
-        log.info(f"Global feed: {len(recent_trades)} large trades in last {CFG['WHALE_LOOKBACK_MIN']}min")
+        profitable_trades = [t for t in recent_trades if t["wallet"] in profitable]
+        actionable = [t for t in profitable_trades if t["market_id"] in market_ids]
+        log.info(
+            f"Global feed: {len(recent_trades)} trades ≥${CFG['WHALE_MIN_SIZE']:.0f} in last {CFG['WHALE_LOOKBACK_MIN']}min"
+            f" → {len(profitable_trades)} from profitable wallets → {len(actionable)} on tracked markets"
+        )
         for trade in recent_trades:
             if trade["wallet"] not in profitable:
                 continue  # active but not proven profitable — skip
@@ -477,7 +482,7 @@ def get_whale_signal(markets: list[dict]) -> Optional[dict]:
         return None
 
     # Global feed unavailable — fall back to polling profitable wallets individually
-    log.info("Global feed unavailable — polling profitable wallets individually (capped at 10)...")
+    log.info(f"Global feed unavailable — polling up to 10 profitable wallets individually (min size=${CFG['WHALE_MIN_SIZE']:.0f}, lookback={CFG['WHALE_LOOKBACK_MIN']}min)...")
     for wallet in list(profitable)[:10]:
         for trade in fetch_whale_recent_trades(wallet, CFG["WHALE_LOOKBACK_MIN"]):
             if trade["market_id"] in market_ids:
