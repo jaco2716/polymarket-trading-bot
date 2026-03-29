@@ -749,9 +749,14 @@ def get_market_winner(market_id: str) -> Optional[str]:
             return None
         if not data.get("closed"):
             return None
-        for token in data.get("tokens") or []:
+        tokens = data.get("tokens") or []
+        for token in tokens:
             if token.get("winner"):
-                return str(token.get("outcome", "")).lower()
+                outcome = str(token.get("outcome", "")).lower()
+                if outcome in ("yes", "no"):
+                    return outcome
+                # Non-binary outcome (team name etc.) — infer from token index: first token = YES
+                return "yes" if tokens.index(token) == 0 else "no"
         return None
     else:
         data = get(f"{GAMMA_URL}/markets/{market_id}")
@@ -782,9 +787,13 @@ def get_market_winner(market_id: str) -> Optional[str]:
         if condition_id:
             clob_data = get(f"{CLOB_URL}/markets/{condition_id}")
             if clob_data and isinstance(clob_data, dict) and clob_data.get("closed"):
-                for token in clob_data.get("tokens") or []:
+                clob_tokens = clob_data.get("tokens") or []
+                for token in clob_tokens:
                     if token.get("winner"):
-                        return str(token.get("outcome", "")).lower()
+                        outcome = str(token.get("outcome", "")).lower()
+                        if outcome in ("yes", "no"):
+                            return outcome
+                        return "yes" if clob_tokens.index(token) == 0 else "no"
         return None
 
 # ── Auto-resolver: checks if open trades have settled ─────────────────────────

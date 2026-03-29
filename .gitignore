@@ -7,6 +7,8 @@ bot.log.*
 budget.json
 shadow_budget.json
 paper_trades.db
+paper_trades.db-shm
+paper_trades.db-wal
 
 # Python cache files
 __pycache__/
