@@ -74,6 +74,11 @@ def overview():
     """)
     resolved = row.get("resolved_trades") or 0
     wins     = row.get("wins") or 0
+
+    shadow_row = db_one("""
+        SELECT COALESCE(ROUND(SUM(pnl), 2), 0) AS resolved_pnl
+        FROM shadow_trades WHERE resolved=1
+    """)
     return jsonify({
         "budget":                  get_budget(),
         "starting_budget":         STARTING_BUDGET,
@@ -88,6 +93,8 @@ def overview():
         "total_pnl":        row.get("total_pnl") or 0,
         "total_fees":       row.get("total_fees") or 0,
         "win_rate":         round(wins / resolved * 100, 1) if resolved else 0,
+        "resolved_pnl":     row.get("total_pnl") or 0,
+        "shadow_resolved_pnl": shadow_row.get("resolved_pnl") or 0,
     })
 
 
