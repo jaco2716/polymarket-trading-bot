@@ -140,7 +140,7 @@ def trades():
 def shadow_trades():
     return jsonify(db_query("""
         SELECT id, ts, strategy, market_name, direction, price, amount,
-               resolved, outcome, pnl, close_ts
+               resolved, outcome, pnl, close_ts, confidence
         FROM shadow_trades ORDER BY id DESC LIMIT 200
     """))
 

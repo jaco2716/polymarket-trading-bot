@@ -863,12 +863,18 @@ def _run_haiku_slot(con, budget: float, markets: list[dict], traded: set,
             break
         analysis = haiku_analyse(m, shadow=shadow)
         time.sleep(0.5)
-        if not analysis or not analysis.get("edge"):
+        if not analysis:
             continue
         conf      = float(analysis.get("confidence") or 0)
         min_conf  = CFG["SHADOW_HAIKU_MIN_CONF"] if shadow else CFG["HAIKU_MIN_CONF"]
-        if conf < min_conf:
-            continue
+        # In shadow mode bypass the edge gate — confidence threshold alone decides.
+        # In real mode both edge=true AND confidence threshold must pass.
+        if shadow:
+            if conf < min_conf:
+                continue
+        else:
+            if not analysis.get("edge") or conf < min_conf:
+                continue
         signals += 1
         dir_  = analysis.get("direction", "yes")
         price = m["yes_price"] if dir_ == "yes" else m["no_price"]
