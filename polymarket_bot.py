@@ -91,8 +91,9 @@ CFG = {
     ],
 }
 
-DB_FILE     = "paper_trades.db"
-BUDGET_FILE = "budget.json"
+DB_FILE            = "paper_trades.db"
+BUDGET_FILE        = "budget.json"
+SHADOW_BUDGET_FILE = "shadow_budget.json"
 
 # API base URLs
 GAMMA_URL = "https://gamma-api.polymarket.com"
@@ -179,6 +180,20 @@ def save_budget(b: float):
     with open(tmp, "w") as f:
         json.dump({"budget": round(b, 4)}, f)
     os.replace(tmp, BUDGET_FILE)
+
+def load_shadow_budget() -> float:
+    if os.path.exists(SHADOW_BUDGET_FILE):
+        with open(SHADOW_BUDGET_FILE) as f:
+            return json.load(f)["budget"]
+    b = CFG["SHADOW_STARTING_BUDGET"]
+    save_shadow_budget(b)
+    return b
+
+def save_shadow_budget(b: float):
+    tmp = SHADOW_BUDGET_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"budget": round(b, 4)}, f)
+    os.replace(tmp, SHADOW_BUDGET_FILE)
 
 def open_trade_count(con) -> int:
     return con.execute("SELECT COUNT(*) FROM trades WHERE resolved=0").fetchone()[0]
@@ -830,9 +845,18 @@ def resolve_settled_trades(con) -> float:
 # ── Shadow trade engine ───────────────────────────────────────────────────────
 def log_shadow_trade(con, strategy: str, market: dict, direction: str, price: float,
                      confidence: Optional[float] = None, notes: Optional[str] = None):
-    """Record a hypothetical trade with no budget impact."""
-    amount = round(CFG["SHADOW_STARTING_BUDGET"] * CFG["TRADE_SIZE_PCT"], 2)
+    """Record a hypothetical trade, deducting from the virtual shadow budget."""
+    shadow_budget = load_shadow_budget()
+    amount = round(shadow_budget * CFG["TRADE_SIZE_PCT"], 2)
+    amount = max(amount, CFG["MIN_TRADE_USDC"])
+
+    if amount > shadow_budget * 0.95:
+        log.info(f"Shadow budget too low (${shadow_budget:.2f}) — skipping shadow trade")
+        return
+
     fee = calc_fee(amount, price)
+    new_shadow_budget = shadow_budget - amount - fee
+
     con.execute("""
         INSERT INTO shadow_trades
             (ts, strategy, market_id, market_name, direction, price, amount, fee, confidence, notes)
@@ -850,21 +874,27 @@ def log_shadow_trade(con, strategy: str, market: dict, direction: str, price: fl
         notes,
     ))
     con.commit()
+    save_shadow_budget(new_shadow_budget)
+
     conf_str = f" conf={confidence:.2f}" if confidence is not None else ""
     log.info(
         f"👻 Shadow [{strategy}]{conf_str}: {direction.upper()} on '{market['name'][:55]}' @ {price:.3f}"
+        f"  |  ${amount:.2f} staked  |  Shadow budget: ${shadow_budget:.2f} → ${new_shadow_budget:.2f}"
         + (f" | {notes[:80]}" if notes else "")
     )
 
 def resolve_shadow_trades(con):
-    """Check open shadow trades against market outcomes and record hypothetical P&L."""
+    """Check open shadow trades against market outcomes, record P&L, update shadow budget."""
     rows = con.execute(
         "SELECT id, market_id, direction, price, amount, fee, ts FROM shadow_trades WHERE resolved=0"
     ).fetchall()
     if not rows:
         return
 
+    shadow_budget = load_shadow_budget()
+    total_pnl = 0.0
     now = datetime.now(timezone.utc)
+
     for row_id, market_id, direction, price, amount, fee, ts in rows:
         try:
             age = (now - datetime.fromisoformat(ts)).days
@@ -884,11 +914,18 @@ def resolve_shadow_trades(con):
             UPDATE shadow_trades SET resolved=1, outcome=?, pnl=?, close_ts=? WHERE id=?
         """, (winner, round(pnl, 4), datetime.now(timezone.utc).isoformat(), row_id))
         con.commit()
+
+        shadow_budget += amount + (fee or 0) + pnl
+        total_pnl += pnl
+
         log.info(
             f"👻 Shadow resolved #{row_id}: {'WON' if won else 'LOST'} "
-            f"hypothetical P&L: {pnl:+.2f} USDC"
+            f"P&L: {pnl:+.2f} USDC  |  Shadow budget: ${shadow_budget:.2f}"
         )
         time.sleep(0.2)
+
+    if total_pnl != 0.0:
+        save_shadow_budget(shadow_budget)
 
 # ── Stats printer ─────────────────────────────────────────────────────────────
 def print_stats(con):

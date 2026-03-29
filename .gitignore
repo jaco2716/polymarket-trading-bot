@@ -3,7 +3,9 @@
 
 # Bot runtime files
 bot.log
+bot.log.*
 budget.json
+shadow_budget.json
 paper_trades.db
 
 # Python cache files

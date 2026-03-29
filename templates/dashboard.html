@@ -161,8 +161,9 @@ let pnlChart       = null;
 let chartMode      = 'real';
 let cachedRealPnl  = [];
 let cachedShadowPnl = [];
-let startingBudget  = 500;
-let refreshInterval = 60;
+let startingBudget       = 500;
+let shadowStartingBudget = 500;
+let refreshInterval      = 60;
 let countdown       = 60;
 let countdownTimer;
 
@@ -177,13 +178,21 @@ const pnlSpan = n => `<span class="${pnlCls(n)}">${fmtPnl(n)}</span>`;
 function renderStatCards(ov) {
   const starting = startingBudget;
   const budgetChange = ov.budget != null ? ov.budget - starting : null;
+  const shadowStart  = ov.shadow_starting_budget || startingBudget;
+  const shadowChange = ov.shadow_budget != null ? ov.shadow_budget - shadowStart : null;
 
   const cards = [
     {
       label: 'Budget',
       value: ov.budget != null ? `$${ov.budget.toFixed(2)}` : '—',
-      sub: budgetChange != null ? `${sign(budgetChange)}$${Math.abs(budgetChange).toFixed(2)} from start` : '',
+      sub: budgetChange != null ? `${sign(budgetChange)}$${Math.abs(budgetChange).toFixed(2)} from $${starting}` : '',
       subCls: pnlCls(budgetChange),
+    },
+    {
+      label: 'Shadow Budget',
+      value: ov.shadow_budget != null ? `$${ov.shadow_budget.toFixed(2)}` : '—',
+      sub: shadowChange != null ? `${sign(shadowChange)}$${Math.abs(shadowChange).toFixed(2)} from $${shadowStart}` : '',
+      subCls: pnlCls(shadowChange),
     },
     {
       label: 'Total P&L',
@@ -195,13 +204,7 @@ function renderStatCards(ov) {
     {
       label: 'Win Rate',
       value: ov.resolved_trades > 0 ? `${ov.win_rate}%` : '—',
-      sub: `${ov.wins}W / ${ov.losses}L  (${ov.resolved_trades} resolved)`,
-      subCls: 'muted',
-    },
-    {
-      label: 'Open Positions',
-      value: ov.open_trades,
-      sub: `${ov.total_trades} total trades`,
+      sub: `${ov.wins}W / ${ov.losses}L  ·  ${ov.open_trades} open / ${ov.total_trades} total`,
       subCls: 'muted',
     },
   ];
@@ -295,7 +298,7 @@ function drawChart(points, mode) {
 
   // Header value
   if (isShadow) {
-    const change = latest != null ? latest - startingBudget : null;
+    const change = latest != null ? latest - shadowStartingBudget : null;
     document.getElementById('pnl-total').innerHTML = latest != null
       ? `<span class="${pnlCls(change)}">$${latest.toFixed(2)}</span><span class="text-xs muted ml-2">(${sign(change ?? 0)}$${Math.abs(change ?? 0).toFixed(2)})</span>`
       : '—';
@@ -315,7 +318,7 @@ function drawChart(points, mode) {
     return;
   }
 
-  const refVal  = isShadow ? startingBudget : 0;
+  const refVal  = isShadow ? shadowStartingBudget : 0;
   const color   = (latest ?? refVal) >= refVal ? '#3fb950' : '#f85149';
   const grad    = ctx.createLinearGradient(0, 0, 0, canvas.height);
   grad.addColorStop(0, color + '40');
@@ -530,6 +533,7 @@ async function refresh() {
       fetch('/api/scan-log').then(r => r.json()),
     ]);
     startingBudget = ov.starting_budget || 500;
+    shadowStartingBudget = ov.shadow_starting_budget || startingBudget;
     refreshInterval = Math.min(ov.scan_interval || 3600, 300);
     const shadowPnlPoints = shadowPnl.points || shadowPnl;
     renderStatCards(ov);

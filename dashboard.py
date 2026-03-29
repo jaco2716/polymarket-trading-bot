@@ -13,6 +13,7 @@ from flask import Flask, jsonify, render_template
 
 DB_FILE                 = "paper_trades.db"
 BUDGET_FILE             = "budget.json"
+SHADOW_BUDGET_FILE      = "shadow_budget.json"
 STARTING_BUDGET         = float(os.getenv("STARTING_BUDGET", "500"))
 SHADOW_STARTING_BUDGET  = float(os.getenv("SHADOW_STARTING_BUDGET", os.getenv("STARTING_BUDGET", "500")))
 SCAN_INTERVAL           = int(os.getenv("SCAN_INTERVAL", "3600"))
@@ -45,6 +46,13 @@ def get_budget() -> Optional[float]:
         return json.load(f).get("budget")
 
 
+def get_shadow_budget() -> Optional[float]:
+    if not os.path.exists(SHADOW_BUDGET_FILE):
+        return None
+    with open(SHADOW_BUDGET_FILE) as f:
+        return json.load(f).get("budget")
+
+
 @app.route("/")
 def index():
     return render_template("dashboard.html")
@@ -65,9 +73,11 @@ def overview():
     resolved = row.get("resolved_trades") or 0
     wins     = row.get("wins") or 0
     return jsonify({
-        "budget":           get_budget(),
-        "starting_budget":  STARTING_BUDGET,
-        "scan_interval":    SCAN_INTERVAL,
+        "budget":                  get_budget(),
+        "starting_budget":         STARTING_BUDGET,
+        "shadow_budget":           get_shadow_budget(),
+        "shadow_starting_budget":  SHADOW_STARTING_BUDGET,
+        "scan_interval":           SCAN_INTERVAL,
         "total_trades":     row.get("total_trades", 0),
         "open_trades":      row.get("open_trades", 0),
         "resolved_trades":  resolved,
