@@ -11,11 +11,12 @@ import sqlite3
 from typing import Optional
 from flask import Flask, jsonify, render_template
 
-DB_FILE          = "paper_trades.db"
-BUDGET_FILE      = "budget.json"
-STARTING_BUDGET  = float(os.getenv("STARTING_BUDGET", "500"))
-SCAN_INTERVAL    = int(os.getenv("SCAN_INTERVAL", "3600"))
-app              = Flask(__name__)
+DB_FILE                 = "paper_trades.db"
+BUDGET_FILE             = "budget.json"
+STARTING_BUDGET         = float(os.getenv("STARTING_BUDGET", "500"))
+SHADOW_STARTING_BUDGET  = float(os.getenv("SHADOW_STARTING_BUDGET", os.getenv("STARTING_BUDGET", "500")))
+SCAN_INTERVAL           = int(os.getenv("SCAN_INTERVAL", "3600"))
+app                     = Flask(__name__)
 
 
 def db_query(sql: str, params: tuple = ()) -> list:
@@ -173,12 +174,12 @@ def shadow_pnl_history():
         WHERE resolved=1 AND pnl IS NOT NULL
         ORDER BY close_ts ASC
     """)
-    balance = STARTING_BUDGET
+    balance = SHADOW_STARTING_BUDGET
     points = [{"ts": None, "pnl": round(balance, 2)}]
     for r in rows:
         balance += r["pnl"]
         points.append({"ts": (r["close_ts"] or "")[:16], "pnl": round(balance, 2)})
-    return jsonify({"starting_budget": STARTING_BUDGET, "points": points})
+    return jsonify({"starting_budget": SHADOW_STARTING_BUDGET, "points": points})
 
 
 @app.route("/api/scan-log")

@@ -47,9 +47,10 @@ CFG = {
     "ANTHROPIC_API_KEY":  os.getenv("ANTHROPIC_API_KEY", ""),
 
     # Budget
-    "STARTING_BUDGET":    float(os.getenv("STARTING_BUDGET",  "500")),
-    "TRADE_SIZE_PCT":     float(os.getenv("TRADE_SIZE_PCT",   "0.03")),  # 3% of budget per trade
-    "MIN_TRADE_USDC":     float(os.getenv("MIN_TRADE_USDC",   "5")),
+    "STARTING_BUDGET":         float(os.getenv("STARTING_BUDGET",         "500")),
+    "SHADOW_STARTING_BUDGET":  float(os.getenv("SHADOW_STARTING_BUDGET",  os.getenv("STARTING_BUDGET", "500"))),
+    "TRADE_SIZE_PCT":          float(os.getenv("TRADE_SIZE_PCT",          "0.03")),  # 3% of budget per trade
+    "MIN_TRADE_USDC":          float(os.getenv("MIN_TRADE_USDC",          "5")),
 
     # Market filters
     "MIN_LIQUIDITY":      float(os.getenv("MIN_LIQUIDITY",    "2000")),  # skip thin markets
@@ -830,7 +831,7 @@ def resolve_settled_trades(con) -> float:
 def log_shadow_trade(con, strategy: str, market: dict, direction: str, price: float,
                      confidence: Optional[float] = None, notes: Optional[str] = None):
     """Record a hypothetical trade with no budget impact."""
-    amount = round(CFG["STARTING_BUDGET"] * CFG["TRADE_SIZE_PCT"], 2)
+    amount = round(CFG["SHADOW_STARTING_BUDGET"] * CFG["TRADE_SIZE_PCT"], 2)
     fee = calc_fee(amount, price)
     con.execute("""
         INSERT INTO shadow_trades
