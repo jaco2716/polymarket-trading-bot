@@ -284,45 +284,47 @@ def fetch_markets(randomize: bool = False) -> list[dict]:
         pool.sort(key=lambda m: -m["_score"])
         result = pool[:CFG["MARKETS_PER_SCAN"]]
 
-    log.info(f"Fetched {len(pool)} qualifying markets → selected top {len(result)} by interest score")
+    selection_method = "randomly sampled" if randomize else "top by interest score"
+    log.info(f"Fetched {len(pool)} qualifying markets → {selection_method} {len(result)}")
     return result
 
 # ── Data API — whale tracking ─────────────────────────────────────────────────
-def fetch_whale_recent_trades(wallet: str, lookback_min: int = 30) -> list[dict]:
-    """Get recent trades for a wallet address."""
-    data = get(f"{DATA_URL}/activity", params={"user": wallet, "limit": 50})
+def fetch_whale_positions(wallet: str, min_size: float) -> list[dict]:
+    """Get current open positions for a wallet above min_size USDC."""
+    data = get(f"{DATA_URL}/positions", params={
+        "user":          wallet,
+        "sizeThreshold": 1,
+        "limit":         100,
+        "sortBy":        "CURRENT",
+        "sortDirection": "DESC",
+    })
     if not data:
         return []
 
-    trades = data if isinstance(data, list) else data.get("history", [])
-    cutoff = time.time() - lookback_min * 60
-    recent = []
-
-    for t in trades:
+    positions = data if isinstance(data, list) else data.get("data", [])
+    result = []
+    for p in positions:
         try:
-            ts = t.get("timestamp") or t.get("createdAt") or 0
-            if isinstance(ts, str):
-                ts = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
-            if ts < cutoff:
+            # Skip resolved/redeemable positions
+            if p.get("redeemable") or float(p.get("curPrice") or 0) <= 0:
                 continue
 
-            size = float(t.get("usdcSize") or t.get("size") or 0)
-            if size < CFG["WHALE_MIN_SIZE"]:
+            current_value = float(p.get("currentValue") or 0)
+            if current_value < min_size:
                 continue
 
-            recent.append({
-                "market_id":  t.get("conditionId") or t.get("market"),
-                "market_name": t.get("title") or t.get("market", ""),
-                "direction":  "yes" if str(t.get("outcome", "")).lower() in ("yes", "1", "true") else "no",
-                "price":      float(t.get("price") or 0.5),
-                "size":       size,
-                "ts":         ts,
-                "wallet":     wallet,
+            direction = "yes" if p.get("outcomeIndex") == 0 else "no"
+            result.append({
+                "market_id":   p.get("conditionId") or "",
+                "market_name": p.get("title") or "",
+                "direction":   direction,
+                "price":       float(p.get("curPrice") or 0.5),
+                "size":        current_value,
+                "wallet":      wallet,
             })
         except (TypeError, ValueError):
             continue
-
-    return recent
+    return result
 
 _WALLET_RE = re.compile(r'^0x[0-9a-fA-F]{40}$')
 
@@ -339,9 +341,10 @@ def fetch_profitable_wallet_set(top_n: int = 30) -> set[str]:
         return cached_set
 
     data = get(f"{DATA_URL}/v1/leaderboard", params={
-        "limit": top_n,
-        "timePeriod": "ALL",
-        "orderBy": "PNL",
+        "limit":      top_n,
+        "category":   "OVERALL",
+        "timePeriod": "WEEK",
+        "orderBy":    "PNL",
     })
     if not data:
         return cached_set  # return stale cache on failure rather than empty
@@ -357,150 +360,71 @@ def fetch_profitable_wallet_set(top_n: int = 30) -> set[str]:
     log.info(f"Leaderboard refreshed: {len(wallets)} profitable wallets cached")
     return wallets
 
-def fetch_global_recent_trades(min_size: float, lookback_min: int) -> list[dict]:
-    """
-    Fetch recent large trades from the global activity feed.
-    Returns parsed trade dicts with wallet, market_id, direction, size, ts.
-    """
-    cutoff = time.time() - lookback_min * 60
-
-    # Try the global trades endpoint first
-    data = get(f"{DATA_URL}/trades", params={"limit": 200, "sizeThreshold": min_size})
-    if not data:
-        # Fallback: global activity without user filter
-        data = get(f"{DATA_URL}/activity", params={"limit": 200})
-    if not data:
-        return []
-
-    trades_raw = data if isinstance(data, list) else (
-        data.get("trades") or data.get("history") or data.get("data") or []
-    )
-    result = []
-    for t in trades_raw:
-        try:
-            ts = t.get("timestamp") or t.get("createdAt") or 0
-            if isinstance(ts, str):
-                ts = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
-            if ts < cutoff:
-                continue
-
-            size = float(t.get("usdcSize") or t.get("size") or 0)
-            if size < min_size:
-                continue
-
-            wallet = t.get("maker") or t.get("taker") or t.get("user") or t.get("address") or ""
-            if not wallet or not _WALLET_RE.match(wallet):
-                continue
-
-            result.append({
-                "wallet":    wallet,
-                "market_id": t.get("conditionId") or t.get("market") or "",
-                "direction": "yes" if str(t.get("outcome", "")).lower() in ("yes", "1", "true") else "no",
-                "price":     float(t.get("price") or 0.5),
-                "size":      size,
-                "ts":        ts,
-            })
-        except (TypeError, ValueError):
-            continue
-
-    return result
 
 def get_whale_signal(markets: list[dict]) -> Optional[dict]:
     """
-    Find a trade signal from a wallet that is both:
-      - Currently active (made a large trade recently), AND
-      - Historically profitable (on the leaderboard)
-
-    Strategy:
-      1. Pull the profitable wallet set from the leaderboard (cached).
-      2. Pull recent global large trades (1-2 API calls).
-      3. Return the first trade whose wallet is in the profitable set
-         and whose market is in our current watch list.
-      4. If the global feed is unavailable, fall back to per-wallet polling
-         of manually configured WHALE_WALLETS.
+    Find a signal by checking current open positions of profitable wallets.
+    Uses /positions endpoint — more reliable than scanning recent trades.
+    Path A: manually configured WHALE_WALLETS (override).
+    Path B: top weekly profitable wallets from leaderboard (auto-discover).
     """
     market_ids = {m["id"]: m for m in markets}
 
     # ── Path A: configured wallets (manual override) ──────────────────────────
     if CFG["WHALE_WALLETS"]:
         for wallet in CFG["WHALE_WALLETS"][:15]:
-            for trade in fetch_whale_recent_trades(wallet, CFG["WHALE_LOOKBACK_MIN"]):
-                if trade["market_id"] in market_ids:
-                    m = market_ids[trade["market_id"]]
+            for pos in fetch_whale_positions(wallet, CFG["WHALE_MIN_SIZE"]):
+                if pos["market_id"] in market_ids:
+                    m = market_ids[pos["market_id"]]
                     log.info(
-                        f"🐋 Whale signal (manual): {wallet[:10]}… "
-                        f"{trade['direction'].upper()} on '{m['name'][:50]}' ${trade['size']:.0f}"
+                        f"🐋 Whale position (manual): {wallet[:10]}… "
+                        f"{pos['direction'].upper()} on '{m['name'][:50]}' holding ${pos['size']:.0f}"
                     )
                     return {
                         "market":     m,
-                        "direction":  trade["direction"],
-                        "price":      m["yes_price"] if trade["direction"] == "yes" else m["no_price"],
+                        "direction":  pos["direction"],
+                        "price":      m["yes_price"] if pos["direction"] == "yes" else m["no_price"],
                         "signal":     "whale-copy",
                         "whale":      wallet,
-                        "whale_size": trade["size"],
-                        "notes":      f"Whale {wallet[:10]}… traded ${trade['size']:.0f}",
+                        "whale_size": pos["size"],
+                        "notes":      f"Whale {wallet[:10]}… holds ${pos['size']:.0f}",
                     }
-            time.sleep(0.2)
+            time.sleep(0.15)
         return None
 
-    # ── Path B: auto-discover active + profitable whales ──────────────────────
+    # ── Path B: positions-based whale discovery ───────────────────────────────
+    # Fetch top weekly profitable wallets, then check what each currently holds.
+    # Positions are current open bets — more reliable than scanning recent trades.
     profitable = fetch_profitable_wallet_set(top_n=30)
     if not profitable:
         log.info("Leaderboard unavailable — skipping whale strategy this scan")
         return None
 
-    log.info(f"Scanning global trade feed for activity from {len(profitable)} profitable wallets... (min size=${CFG['WHALE_MIN_SIZE']:.0f}, lookback={CFG['WHALE_LOOKBACK_MIN']}min)")
-    recent_trades = fetch_global_recent_trades(CFG["WHALE_MIN_SIZE"], CFG["WHALE_LOOKBACK_MIN"])
-
-    if recent_trades:
-        profitable_trades = [t for t in recent_trades if t["wallet"] in profitable]
-        actionable = [t for t in profitable_trades if t["market_id"] in market_ids]
-        log.info(
-            f"Global feed: {len(recent_trades)} trades ≥${CFG['WHALE_MIN_SIZE']:.0f} in last {CFG['WHALE_LOOKBACK_MIN']}min"
-            f" → {len(profitable_trades)} from profitable wallets → {len(actionable)} on tracked markets"
-        )
-        for trade in recent_trades:
-            if trade["wallet"] not in profitable:
-                continue  # active but not proven profitable — skip
-            if trade["market_id"] not in market_ids:
-                continue  # not a market we're watching
-            m = market_ids[trade["market_id"]]
+    log.info(f"Scanning positions for {len(profitable)} top weekly wallets (min size=${CFG['WHALE_MIN_SIZE']:.0f})...")
+    wallets = list(profitable)[:15]  # cap API calls at 15 wallets per scan
+    total_positions = 0
+    for wallet in wallets:
+        positions = fetch_whale_positions(wallet, CFG["WHALE_MIN_SIZE"])
+        total_positions += len(positions)
+        for pos in positions:
+            if pos["market_id"] not in market_ids:
+                continue
+            m = market_ids[pos["market_id"]]
             log.info(
-                f"🐋 Whale signal (active+profitable): {trade['wallet'][:10]}… "
-                f"{trade['direction'].upper()} on '{m['name'][:50]}' ${trade['size']:.0f}"
+                f"🐋 Whale position: {wallet[:10]}… "
+                f"{pos['direction'].upper()} on '{m['name'][:50]}' (holding ${pos['size']:.0f})"
             )
             return {
                 "market":     m,
-                "direction":  trade["direction"],
-                "price":      m["yes_price"] if trade["direction"] == "yes" else m["no_price"],
+                "direction":  pos["direction"],
+                "price":      m["yes_price"] if pos["direction"] == "yes" else m["no_price"],
                 "signal":     "whale-copy",
-                "whale":      trade["wallet"],
-                "whale_size": trade["size"],
-                "notes":      f"Whale {trade['wallet'][:10]}… traded ${trade['size']:.0f}",
+                "whale":      wallet,
+                "whale_size": pos["size"],
+                "notes":      f"Whale {wallet[:10]}… holds ${pos['size']:.0f}",
             }
-        log.info("No overlap between active large traders and profitable leaderboard this scan")
-        return None
-
-    # Global feed unavailable — fall back to polling profitable wallets individually
-    log.info(f"Global feed unavailable — polling up to 10 profitable wallets individually (min size=${CFG['WHALE_MIN_SIZE']:.0f}, lookback={CFG['WHALE_LOOKBACK_MIN']}min)...")
-    for wallet in list(profitable)[:10]:
-        for trade in fetch_whale_recent_trades(wallet, CFG["WHALE_LOOKBACK_MIN"]):
-            if trade["market_id"] in market_ids:
-                m = market_ids[trade["market_id"]]
-                log.info(
-                    f"🐋 Whale signal (fallback): {wallet[:10]}… "
-                    f"{trade['direction'].upper()} on '{m['name'][:50]}' ${trade['size']:.0f}"
-                )
-                return {
-                    "market":     m,
-                    "direction":  trade["direction"],
-                    "price":      m["yes_price"] if trade["direction"] == "yes" else m["no_price"],
-                    "signal":     "whale-copy",
-                    "whale":      wallet,
-                    "whale_size": trade["size"],
-                    "notes":      f"Whale {wallet[:10]}… traded ${trade['size']:.0f} (fallback)",
-                }
-        time.sleep(0.2)
+        time.sleep(0.15)
+    log.info(f"Whale scan: {total_positions} open positions checked across {len(wallets)} wallets — no overlap with tracked markets")
     return None
 
 # ── Google News — context for Haiku ──────────────────────────────────────────
@@ -824,6 +748,8 @@ def print_stats(con):
     """).fetchone()
 
     total, resolved, open_c, wins, pnl, fees = rows
+    pnl   = pnl   or 0.0
+    fees  = fees  or 0.0
     win_rate = f"{wins/resolved*100:.1f}%" if resolved else "n/a"
     budget = load_budget()
 
@@ -988,11 +914,14 @@ def run_scan(con):
     else:
         traded_this_scan: set = open_market_ids(con)
 
-    # Fetch whale signal once — shared by both whale slots
+    # Fetch whale signal once — shared by both whale slots.
+    # Use the full unsampled pool so whale positions aren't limited to the
+    # random 20 markets chosen for Haiku.
     whale_signal = None
     if CFG["ENABLE_WHALE_COPY"]:
         log.info("Checking whale wallets...")
-        whale_signal = get_whale_signal(markets)
+        whale_markets = fetch_markets(randomize=False)  # full ranked pool, no random sampling
+        whale_signal = get_whale_signal(whale_markets if whale_markets else markets)
 
     if mode == "shadow":
         # ── Shadow mode: evaluate all 3 strategies, log hypothetical trades ──
@@ -1063,7 +992,8 @@ def main():
         budget = load_budget()
         log.info(f"Starting budget: ${budget:.2f} USDC")
         log.info(f"Strategies: haiku={CFG['ENABLE_HAIKU']}, whale_copy={CFG['ENABLE_WHALE_COPY']}, mode={CFG['STRATEGY_MODE']}")
-        log.info(f"Scan interval: {CFG['SCAN_INTERVAL']}s  |  Max open trades: {CFG['MAX_OPEN_TRADES']}")
+        interval_display = CFG["SHADOW_SCAN_INTERVAL"] if CFG["STRATEGY_MODE"] == "shadow" else CFG["SCAN_INTERVAL"]
+        log.info(f"Scan interval: {interval_display}s  |  Max open trades: {CFG['MAX_OPEN_TRADES']}")
         log.info(f"Trade size: {CFG['TRADE_SIZE_PCT']*100:.0f}% of budget per trade (~${budget*CFG['TRADE_SIZE_PCT']:.2f})")
 
         scan_count = 0
