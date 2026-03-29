@@ -4,7 +4,11 @@
       "Bash(python3:*)",
       "Bash(curl -s 'https://data-api.polymarket.com/v1/leaderboard?category=OVERALL&timePeriod=WEEK&orderBy=PNL&limit=3')",
       "Bash(curl -s 'https://data-api.polymarket.com/positions?sizeThreshold=1&limit=5&sortBy=TOKENS&sortDirection=DESC&user=0x02227b8f5a9636e895607edd3185ed6ee5598ff7')",
-      "Bash(curl -s 'https://data-api.polymarket.com/positions?user=0x02227b8f5a9636e895607edd3185ed6ee5598ff7&sizeThreshold=1&limit=5&sortBy=CURRENT_VALUE&sortDirection=DESC')"
+      "Bash(curl -s 'https://data-api.polymarket.com/positions?user=0x02227b8f5a9636e895607edd3185ed6ee5598ff7&sizeThreshold=1&limit=5&sortBy=CURRENT_VALUE&sortDirection=DESC')",
+      "Bash(curl -s 'https://data-api.polymarket.com/positions?user=0x02227b8f5a9636e895607edd3185ed6ee5598ff7&sizeThreshold=1&limit=5&sortBy=CURRENT&sortDirection=DESC')",
+      "Bash(curl -s 'https://gamma-api.polymarket.com/markets?conditionIds=0x895e01dbf3e6a33cd9a44ca0f8cdb5df1bd2b0b6ebed5300d28f8da7145145e4')",
+      "Bash(curl -s 'https://gamma-api.polymarket.com/markets?conditionId=0x895e01dbf3e6a33cd9a44ca0f8cdb5df1bd2b0b6ebed5300d28f8da7145145e4')",
+      "Bash(curl -s 'https://gamma-api.polymarket.com/markets?conditionIds=0x895e01dbf3e6a33cd9a44ca0f8cdb5df1bd2b0b6ebed5300d28f8da7145145e4&limit=1')"
     ]
   }
 }

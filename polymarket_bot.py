@@ -289,6 +289,39 @@ def fetch_markets(randomize: bool = False) -> list[dict]:
     return result
 
 # ── Data API — whale tracking ─────────────────────────────────────────────────
+def fetch_market_by_id(condition_id: str) -> Optional[dict]:
+    """Fetch a single market by conditionId using the CLOB API."""
+    data = get(f"{CLOB_URL}/markets/{condition_id}")
+    if not data or not isinstance(data, dict):
+        return None
+    try:
+        if data.get("closed") or not data.get("active", True):
+            return None
+        tokens = data.get("tokens") or []
+        yes_token = next((t for t in tokens if t.get("outcome", "").lower() == "yes"), None)
+        no_token  = next((t for t in tokens if t.get("outcome", "").lower() == "no"),  None)
+        if not yes_token:
+            return None
+        yes_price = float(yes_token.get("price") or 0)
+        if yes_price <= 0:
+            return None
+        token_id = yes_token.get("token_id")
+        return {
+            "id":         condition_id,
+            "name":       data.get("question", "Unknown"),
+            "yes_price":  yes_price,
+            "no_price":   round(1 - yes_price, 4),
+            "liquidity":  0.0,   # not available from CLOB endpoint
+            "volume_24h": 0.0,
+            "token_id":   token_id,
+            "end_date":   data.get("end_date_iso"),
+            "slug":       data.get("market_slug", ""),
+            "tags":       data.get("tags") or [],
+        }
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
 def fetch_whale_positions(wallet: str, min_size: float) -> list[dict]:
     """Get current open positions for a wallet above min_size USDC."""
     data = get(f"{DATA_URL}/positions", params={
@@ -407,9 +440,12 @@ def get_whale_signal(markets: list[dict]) -> Optional[dict]:
         positions = fetch_whale_positions(wallet, CFG["WHALE_MIN_SIZE"])
         total_positions += len(positions)
         for pos in positions:
-            if pos["market_id"] not in market_ids:
-                continue
-            m = market_ids[pos["market_id"]]
+            # Try pre-filtered list first; if not found, look up the market directly
+            m = market_ids.get(pos["market_id"])
+            if m is None:
+                m = fetch_market_by_id(pos["market_id"])
+                if m is None:
+                    continue
             log.info(
                 f"🐋 Whale position: {wallet[:10]}… "
                 f"{pos['direction'].upper()} on '{m['name'][:50]}' (holding ${pos['size']:.0f})"
@@ -424,7 +460,7 @@ def get_whale_signal(markets: list[dict]) -> Optional[dict]:
                 "notes":      f"Whale {wallet[:10]}… holds ${pos['size']:.0f}",
             }
         time.sleep(0.15)
-    log.info(f"Whale scan: {total_positions} open positions checked across {len(wallets)} wallets — no overlap with tracked markets")
+    log.info(f"Whale scan: {total_positions} open positions checked across {len(wallets)} wallets — no signal found")
     return None
 
 # ── Google News — context for Haiku ──────────────────────────────────────────
