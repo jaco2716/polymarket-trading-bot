@@ -5,6 +5,7 @@
 bot.log
 bot.log.*
 budget.json
+live_budget.json
 shadow_budget.json
 paper_trades.db
 paper_trades.db-shm
