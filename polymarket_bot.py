@@ -140,7 +140,7 @@ def get_clob_client():
         CLOB_URL,
         key=CFG["POLYMARKET_PRIVATE_KEY"],
         chain_id=137,
-        signature_type=1 if funder else 0,
+        signature_type=1,
         funder=funder,
     )
     _clob_client.set_api_creds(_clob_client.create_or_derive_api_creds())
@@ -710,6 +710,7 @@ def get_whale_signals(markets: list[dict]) -> list[dict]:
             m = market_ids.get(pos["market_id"])
             if m is None:
                 m = fetch_market_by_id(pos["market_id"])
+                time.sleep(0.3)
                 if m is None:
                     continue
             sig = _make_signal(m, pos, wallet)
@@ -972,6 +973,14 @@ def place_live_trade(
     if not token_id:
         log.error(f"Cannot resolve {direction} token_id for market {market['id']} — skipping")
         return None
+
+    # Skip neg-risk markets — they require conditional token allowances not set up via API
+    try:
+        if get_clob_client().get_neg_risk(token_id):
+            log.info(f"Skipping neg-risk market: {market['name'][:50]}")
+            return None
+    except Exception:
+        pass
 
     fee = calc_fee(amount, price, order_type)
     new_budget = budget - amount - fee
