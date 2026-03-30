@@ -1495,7 +1495,8 @@ def run_scan(con):
 
         if CFG["ENABLE_WHALE_COPY"]:
             whale_cap = CFG["MAX_WHALE_TRADES_PER_SCAN"]
-            for sig in whale_signals[:whale_cap]:
+            fresh = [s for s in whale_signals if s["market"]["id"] not in traded_this_scan]
+            for sig in fresh[:whale_cap]:
                 _, s, t = _run_whale_slot(con, budget, sig, traded_this_scan, shadow=True)
                 signals_found += s; trades_placed += t
 
@@ -1505,7 +1506,8 @@ def run_scan(con):
         # Both strategies share MAX_OPEN_TRADES as the hard cap.
         if CFG["ENABLE_WHALE_COPY"]:
             whale_cap = CFG["MAX_WHALE_TRADES_PER_SCAN"]
-            for sig in whale_signals[:whale_cap]:
+            fresh = [s for s in whale_signals if s["market"]["id"] not in traded_this_scan]
+            for sig in fresh[:whale_cap]:
                 budget, s, t = _run_whale_slot(con, budget, sig, traded_this_scan)
                 signals_found += s; trades_placed += t
 
