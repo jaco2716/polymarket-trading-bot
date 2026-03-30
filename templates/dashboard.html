@@ -208,6 +208,7 @@ function renderStatCards(ov) {
   // Live budget card (shown when live data exists)
   if (hasLiveData) {
     const livePnl = ov.live_total_pnl || 0;
+    const liveOpenAmt = ov.live_open_amount || 0;
     cards.push({
       label: 'Live Budget',
       value: ov.live_budget != null ? `$${ov.live_budget.toFixed(2)}` : '—',
@@ -216,6 +217,8 @@ function renderStatCards(ov) {
       subCls: 'muted',
       sub2: `Live P&L: ${sign(livePnl)}$${Math.abs(livePnl).toFixed(2)}`,
       sub2Cls: pnlCls(livePnl),
+      sub3: `In open trades: $${liveOpenAmt.toFixed(2)}`,
+      sub3Cls: 'muted',
     });
   }
 
@@ -235,6 +238,8 @@ function renderStatCards(ov) {
       subCls: pnlCls(shadowChange),
       sub2: `Resolved P&L: ${sign(shadowResolvedPnl)}$${Math.abs(shadowResolvedPnl).toFixed(2)}`,
       sub2Cls: pnlCls(shadowResolvedPnl),
+      sub3: `In open trades: $${(ov.shadow_open_amount || 0).toFixed(2)}`,
+      sub3Cls: 'muted',
     },
     {
       label: hasLiveData ? 'Live Win Rate' : 'Win Rate',
@@ -254,6 +259,7 @@ function renderStatCards(ov) {
       <div class="text-2xl font-bold ${c.valueCls || 'text-white'}">${c.value}</div>
       <div class="text-xs ${c.subCls} mt-1.5">${c.sub}</div>
       ${c.sub2 ? `<div class="text-xs ${c.sub2Cls || 'muted'} mt-1">${c.sub2}</div>` : ''}
+      ${c.sub3 ? `<div class="text-xs ${c.sub3Cls || 'muted'} mt-1">${c.sub3}</div>` : ''}
     </div>
   `).join('');
 }

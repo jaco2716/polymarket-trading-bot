@@ -85,18 +85,21 @@ def overview():
     wins     = row.get("wins") or 0
 
     shadow_row = db_one("""
-        SELECT COALESCE(ROUND(SUM(pnl), 2), 0) AS resolved_pnl
-        FROM shadow_trades WHERE resolved=1
+        SELECT
+            COALESCE(ROUND(SUM(pnl), 2), 0) AS resolved_pnl,
+            COALESCE(ROUND(SUM(CASE WHEN resolved=0 THEN amount ELSE 0 END), 2), 0) AS open_amount
+        FROM shadow_trades
     """)
 
     live_row = db_one("""
         SELECT
-            COUNT(*)                                                    AS total_trades,
-            COALESCE(SUM(CASE WHEN resolved=0 THEN 1 ELSE 0 END), 0)   AS open_trades,
-            COALESCE(SUM(CASE WHEN resolved=1 THEN 1 ELSE 0 END), 0)   AS resolved_trades,
-            COALESCE(SUM(CASE WHEN pnl > 0   THEN 1 ELSE 0 END), 0)   AS wins,
-            COALESCE(ROUND(SUM(COALESCE(pnl, 0)), 2), 0)               AS total_pnl,
-            COALESCE(ROUND(SUM(COALESCE(fee, 0)), 4), 0)               AS total_fees
+            COUNT(*)                                                                        AS total_trades,
+            COALESCE(SUM(CASE WHEN resolved=0 THEN 1 ELSE 0 END), 0)                       AS open_trades,
+            COALESCE(SUM(CASE WHEN resolved=1 THEN 1 ELSE 0 END), 0)                       AS resolved_trades,
+            COALESCE(SUM(CASE WHEN pnl > 0   THEN 1 ELSE 0 END), 0)                       AS wins,
+            COALESCE(ROUND(SUM(COALESCE(pnl, 0)), 2), 0)                                   AS total_pnl,
+            COALESCE(ROUND(SUM(COALESCE(fee, 0)), 4), 0)                                   AS total_fees,
+            COALESCE(ROUND(SUM(CASE WHEN resolved=0 THEN amount ELSE 0 END), 2), 0)        AS open_amount
         FROM trades WHERE mode IN ('live', 'live-dry')
     """)
     live_resolved = live_row.get("resolved_trades") or 0
@@ -128,6 +131,8 @@ def overview():
         "live_total_pnl":       live_row.get("total_pnl") or 0,
         "live_total_fees":      live_row.get("total_fees") or 0,
         "live_win_rate":        round(live_wins / live_resolved * 100, 1) if live_resolved else 0,
+        "live_open_amount":     live_row.get("open_amount") or 0,
+        "shadow_open_amount":   shadow_row.get("open_amount") or 0,
     })
 
 
