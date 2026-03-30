@@ -550,6 +550,27 @@ def fetch_market_by_id(condition_id: str) -> Optional[dict]:
 
 
 
+_neg_risk_cache: dict[str, bool] = {}
+
+def _is_neg_risk(market: dict, direction: str = "yes") -> bool:
+    """Return True if the market is a neg-risk token. Cached per token_id."""
+    if CFG["STRATEGY_MODE"] != "live":
+        return False
+    yes_tid, no_tid = resolve_token_ids(market)
+    token_id = yes_tid if direction == "yes" else no_tid
+    if not token_id:
+        return False
+    if token_id in _neg_risk_cache:
+        return _neg_risk_cache[token_id]
+    try:
+        result = get_clob_client().get_neg_risk(token_id)
+        _neg_risk_cache[token_id] = bool(result)
+        return bool(result)
+    except Exception:
+        _neg_risk_cache[token_id] = False
+        return False
+
+
 def resolve_token_ids(market: dict) -> tuple[Optional[str], Optional[str]]:
     """Return (yes_token_id, no_token_id) for a market, falling back to CLOB API if needed."""
     yes_tid = market.get("yes_token_id")
@@ -1024,12 +1045,8 @@ def place_live_trade(
         from py_clob_client.order_builder.constants import BUY, SELL
 
         client = get_clob_client()
-        is_neg_risk = client.get_neg_risk(token_id)
-        # Neg-risk NO positions cannot be bought directly with USDC — they require
-        # holding YES tokens of every other outcome in the group (NegRiskAdapter conversion).
-        # Skip them; only neg-risk YES positions (BUY yes_tid) are straightforward.
-        if is_neg_risk and direction == "no":
-            log.info(f"Skipping neg-risk NO signal — cannot replicate without multi-outcome logic: {market['name'][:50]}")
+        if client.get_neg_risk(token_id):
+            log.info(f"Skipping neg-risk market: {market['name'][:50]}")
             return None
         side = BUY if direction == "yes" else SELL
 
@@ -1527,7 +1544,11 @@ def run_scan(con):
         # Both strategies share MAX_OPEN_TRADES as the hard cap.
         if CFG["ENABLE_WHALE_COPY"]:
             whale_cap = CFG["MAX_WHALE_TRADES_PER_SCAN"]
-            fresh = [s for s in whale_signals if s["market"]["id"] not in traded_this_scan]
+            fresh = [
+                s for s in whale_signals
+                if s["market"]["id"] not in traded_this_scan
+                and not _is_neg_risk(s["market"], s["direction"])
+            ]
             for sig in fresh[:whale_cap]:
                 budget, s, t = _run_whale_slot(con, budget, sig, traded_this_scan)
                 signals_found += s; trades_placed += t
