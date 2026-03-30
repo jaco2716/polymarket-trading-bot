@@ -186,7 +186,8 @@ def init_db():
             liquidity   REAL,               -- market liquidity at entry
             volume_24h  REAL,               -- 24h volume at entry
             market_slug TEXT,               -- polymarket URL slug
-            market_tags TEXT                -- market category tags (JSON list)
+            market_tags TEXT,               -- market category tags (JSON list)
+            whale_size  REAL                -- USD size of whale position copied (NULL for non-whale trades)
         )
     """)
     con.execute("""
@@ -246,6 +247,7 @@ def init_db():
         ("volume_24h",  "REAL"),
         ("market_slug", "TEXT"),
         ("market_tags", "TEXT"),
+        ("whale_size",  "REAL"),
     ]:
         try:
             con.execute(f"ALTER TABLE trades ADD COLUMN {col} {definition}")
@@ -872,6 +874,7 @@ def place_paper_trade(
     order_type: str,
     tags: list[str],
     notes: str = "",
+    whale_size: Optional[float] = None,
 ) -> Optional[float]:
     """
     Simulate placing a trade. Deducts from budget and writes to DB.
@@ -895,8 +898,9 @@ def place_paper_trade(
     con.execute("""
         INSERT INTO trades
             (ts, market_id, market_name, token_id, direction, price, amount,
-             fee, order_type, tags, notes, end_date, liquidity, volume_24h, market_slug, market_tags)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             fee, order_type, tags, notes, end_date, liquidity, volume_24h, market_slug, market_tags,
+             whale_size)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
         datetime.now(timezone.utc).isoformat(),
         market["id"],
@@ -914,6 +918,7 @@ def place_paper_trade(
         market.get("volume_24h"),
         market.get("slug"),
         json.dumps(market.get("tags") or []),
+        whale_size,
     ))
     con.commit()
     save_budget(new_budget)
@@ -940,6 +945,7 @@ def place_live_trade(
     order_type: str,
     tags: list[str],
     notes: str = "",
+    whale_size: Optional[float] = None,
 ) -> Optional[float]:
     """
     Place a real trade on Polymarket via the CLOB API.
@@ -975,8 +981,9 @@ def place_live_trade(
             INSERT INTO trades
                 (ts, market_id, market_name, token_id, direction, price, amount,
                  fee, order_type, tags, notes, mode,
-                 end_date, liquidity, volume_24h, market_slug, market_tags)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 end_date, liquidity, volume_24h, market_slug, market_tags,
+                 whale_size)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             datetime.now(timezone.utc).isoformat(),
             market["id"], market["name"], token_id,
@@ -984,6 +991,7 @@ def place_live_trade(
             json.dumps(tags), notes, "live-dry",
             market.get("end_date"), market.get("liquidity"), market.get("volume_24h"),
             market.get("slug"), json.dumps(market.get("tags") or []),
+            whale_size,
         ))
         con.commit()
         save_live_budget(new_budget)
@@ -1038,8 +1046,9 @@ def place_live_trade(
         INSERT INTO trades
             (ts, market_id, market_name, token_id, direction, price, amount,
              fee, order_type, tags, notes, mode, order_id,
-             end_date, liquidity, volume_24h, market_slug, market_tags)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             end_date, liquidity, volume_24h, market_slug, market_tags,
+             whale_size)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
         datetime.now(timezone.utc).isoformat(),
         market["id"], market["name"], token_id,
@@ -1047,6 +1056,7 @@ def place_live_trade(
         json.dumps(tags), notes, "live", order_id,
         market.get("end_date"), market.get("liquidity"), market.get("volume_24h"),
         market.get("slug"), json.dumps(market.get("tags") or []),
+        whale_size,
     ))
     con.commit()
     save_live_budget(new_budget)
@@ -1348,11 +1358,11 @@ def _is_sports_matchup(name: str) -> bool:
     return any(p in name for p in _SPORTS_PATTERNS)
 
 
-def _place_trade(con, budget, market, direction, price, order_type, tags, notes=""):
+def _place_trade(con, budget, market, direction, price, order_type, tags, notes="", whale_size=None):
     """Dispatch to live or paper trade placement based on mode."""
     if CFG["STRATEGY_MODE"] == "live":
-        return place_live_trade(con, budget, market, direction, price, order_type, tags, notes)
-    return place_paper_trade(con, budget, market, direction, price, order_type, tags, notes)
+        return place_live_trade(con, budget, market, direction, price, order_type, tags, notes, whale_size)
+    return place_paper_trade(con, budget, market, direction, price, order_type, tags, notes, whale_size)
 
 
 def _run_haiku_slot(con, budget: float, markets: list[dict], traded: set,
@@ -1427,7 +1437,7 @@ def _run_whale_slot(con, budget: float, whale_signal: Optional[dict], traded: se
         traded.add(m["id"])
         return budget, 1, 1
 
-    new_budget = _place_trade(con, budget, m, dir_, price, "taker", ["whale-copy"], whale_signal["notes"])
+    new_budget = _place_trade(con, budget, m, dir_, price, "taker", ["whale-copy"], whale_signal["notes"], whale_signal.get("whale_size"))
     if new_budget is not None:
         traded.add(m["id"])
         return new_budget, 1, 1

@@ -39,7 +39,7 @@
           class="px-6 py-4 flex items-center justify-between sticky top-0 z-20">
     <div>
       <h1 class="text-sm font-bold text-white tracking-wide" id="header-title">POLYMARKET TRADING BOT</h1>
-      <p class="text-xs muted mt-0.5" id="header-sub">Trading simulation · Option for live trading with real money/p>
+      <p class="text-xs muted mt-0.5" id="header-sub">Trading simulation · Option for live trading with real money</p>
     </div>
     <div class="text-right text-xs muted space-y-0.5">
       <div id="last-updated">—</div>
@@ -129,6 +129,7 @@
               <th class="px-3 py-2 text-right">Price</th>
               <th class="px-3 py-2 text-right">Staked</th>
               <th class="px-3 py-2 text-left">Strategy</th>
+              <th class="px-3 py-2 text-right">Whale $</th>
               <th class="px-3 py-2 text-center hidden" id="conf-col-header">Conf</th>
               <th class="px-3 py-2 text-center">Status</th>
               <th class="px-3 py-2 text-right">P&amp;L</th>
@@ -565,6 +566,7 @@ function renderTradesTable() {
           ${t.fee != null ? `<div class="text-xs" style="color:#6e7681">fee $${t.fee.toFixed(2)}</div>` : ''}
         </td>
         <td class="px-3 py-2 muted">${tagStr}</td>
+        <td class="px-3 py-2 text-right muted">${t.whale_size != null ? '$' + t.whale_size.toFixed(0) : '—'}</td>
         <td class="px-3 py-2 text-center">${statusHtml}</td>
         <td class="px-3 py-2 text-right font-medium">${pnlSpan(t.pnl)}</td>
         <td class="px-3 py-2 muted">${fmtDate(t.ts)}</td>
