@@ -135,12 +135,13 @@ def get_clob_client():
     if not CFG["POLYMARKET_PRIVATE_KEY"]:
         raise RuntimeError("POLYMARKET_PRIVATE_KEY not set — cannot trade in live mode")
     from py_clob_client.client import ClobClient
+    funder = CFG["POLYMARKET_FUNDER_ADDRESS"] or None
     _clob_client = ClobClient(
         CLOB_URL,
         key=CFG["POLYMARKET_PRIVATE_KEY"],
         chain_id=137,
-        signature_type=0,
-        funder=CFG["POLYMARKET_FUNDER_ADDRESS"] or None,
+        signature_type=1 if funder else 0,
+        funder=funder,
     )
     _clob_client.set_api_creds(_clob_client.create_or_derive_api_creds())
     log.info("CLOB client initialised (Polygon mainnet)")
