@@ -13,8 +13,7 @@ Modes:
 
 Strategies:
   1. haiku-analyse  — Claude Haiku checks for positive edge
-  2. whale-copy     — mirrors trades from tracked whale wallets
-  3. whale+haiku    — whale signal confirmed by Haiku before entry
+  2. whale-copy     — mirrors trades from tracked whale wallets (runs independently, not competing with Haiku)
 
 Setup:
   pip install -r requirements.txt
@@ -61,7 +60,9 @@ CFG = {
     # Market filters
     "MIN_LIQUIDITY":      float(os.getenv("MIN_LIQUIDITY",    "2000")),  # skip thin markets
     "MAX_TRADE_PRICE":    float(os.getenv("MAX_TRADE_PRICE",  "0.85")),  # skip near-certain outcomes; forces yes/no into [0.15, 0.85]
-    "MAX_RESOLVE_HOURS":  float(os.getenv("MAX_RESOLVE_HOURS", "0")),    # 0 = no limit; set e.g. 24 for same-day markets only
+    "MIN_TRADE_PRICE":    float(os.getenv("MIN_TRADE_PRICE",  "0.15")),  # skip very cheap markets (high-loss territory)
+    "MAX_RESOLVE_HOURS":       float(os.getenv("MAX_RESOLVE_HOURS",       "0")),  # 0 = no limit; set e.g. 24 for same-day markets only
+    "MAX_WHALE_RESOLVE_HOURS": float(os.getenv("MAX_WHALE_RESOLVE_HOURS", "0")),  # 0 = no limit; whales often hold long-term positions
     "MARKET_POOL_SIZE":   int(os.getenv("MARKET_POOL_SIZE",   "100")),   # fetch this many, then rank and pick best
     "MARKETS_PER_SCAN":   int(os.getenv("MARKETS_PER_SCAN",   "20")),    # top N to send to Haiku after ranking
 
@@ -72,8 +73,11 @@ CFG = {
     "SHADOW_HAIKU_MIN_CONF":  float(os.getenv("SHADOW_HAIKU_MIN_CONF", "0.35")),  # lower threshold for shadow data collection
     "CONF_FLOOR":             float(os.getenv("CONF_FLOOR",             "0.45")),  # lowest confidence accepted (for low-price markets)
     "SIZE_FLOOR":             float(os.getenv("SIZE_FLOOR",              "0.5")),   # min trade size fraction (for low-price markets)
-    "HAIKU_SKIP_SPORTS":      os.getenv("HAIKU_SKIP_SPORTS", "true").lower() == "true",  # block game matchups/spreads
-    "WHALE_MIN_SIZE":         float(os.getenv("WHALE_MIN_SIZE",   "500")),   # min USD for whale trade
+    "HAIKU_SKIP_SPORTS":          os.getenv("HAIKU_SKIP_SPORTS", "true").lower() == "true",  # block game matchups/spreads
+    "WHALE_MIN_SIZE":             float(os.getenv("WHALE_MIN_SIZE",             "500")),  # min USD for whale trade
+    "MAX_WHALE_TRADES_PER_SCAN":  int(os.getenv("MAX_WHALE_TRADES_PER_SCAN",    "5")),   # cap on whale trades in a single scan
+    "WHALE_LEADERBOARD_SIZE":     int(os.getenv("WHALE_LEADERBOARD_SIZE",       "30")),  # how many top wallets to fetch from leaderboard
+    "WHALE_WALLETS_PER_SCAN":     int(os.getenv("WHALE_WALLETS_PER_SCAN",       "15")),  # how many wallets to query for positions each scan
 
     # Limits
     "MAX_OPEN_TRADES":    int(os.getenv("MAX_OPEN_TRADES", "10")),
@@ -177,7 +181,12 @@ def init_db():
             resolved    INTEGER DEFAULT 0,
             outcome     TEXT,               -- yes | no | NULL
             pnl         REAL,               -- realised P&L after fee
-            close_ts    TEXT
+            close_ts    TEXT,
+            end_date    TEXT,               -- market resolution date (ISO)
+            liquidity   REAL,               -- market liquidity at entry
+            volume_24h  REAL,               -- 24h volume at entry
+            market_slug TEXT,               -- polymarket URL slug
+            market_tags TEXT                -- market category tags (JSON list)
         )
     """)
     con.execute("""
@@ -193,7 +202,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS shadow_trades (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             ts          TEXT    NOT NULL,
-            strategy    TEXT    NOT NULL,   -- haiku-analyse | whale-copy | whale+haiku
+            strategy    TEXT    NOT NULL,   -- haiku-analyse | whale-copy
             market_id   TEXT    NOT NULL,
             market_name TEXT    NOT NULL,
             direction   TEXT    NOT NULL,
@@ -205,17 +214,39 @@ def init_db():
             resolved    INTEGER DEFAULT 0,
             outcome     TEXT,
             pnl         REAL,               -- realised P&L after fee
-            close_ts    TEXT
+            close_ts    TEXT,
+            end_date    TEXT,               -- market resolution date (ISO)
+            liquidity   REAL,               -- market liquidity at entry
+            volume_24h  REAL,               -- 24h volume at entry
+            market_slug TEXT,               -- polymarket URL slug
+            market_tags TEXT                -- market category tags (JSON list)
         )
     """)
     # Migrate existing shadow_trades table if columns are missing
-    for col, definition in [("confidence", "REAL"), ("notes", "TEXT"), ("fee", "REAL")]:
+    for col, definition in [
+        ("confidence",  "REAL"),
+        ("notes",       "TEXT"),
+        ("fee",         "REAL"),
+        ("end_date",    "TEXT"),
+        ("liquidity",   "REAL"),
+        ("volume_24h",  "REAL"),
+        ("market_slug", "TEXT"),
+        ("market_tags", "TEXT"),
+    ]:
         try:
             con.execute(f"ALTER TABLE shadow_trades ADD COLUMN {col} {definition}")
         except sqlite3.OperationalError:
             pass  # column already exists
-    # Migrate trades table for live trading support
-    for col, definition in [("mode", "TEXT DEFAULT 'paper'"), ("order_id", "TEXT")]:
+    # Migrate trades table
+    for col, definition in [
+        ("mode",        "TEXT DEFAULT 'paper'"),
+        ("order_id",    "TEXT"),
+        ("end_date",    "TEXT"),
+        ("liquidity",   "REAL"),
+        ("volume_24h",  "REAL"),
+        ("market_slug", "TEXT"),
+        ("market_tags", "TEXT"),
+    ]:
         try:
             con.execute(f"ALTER TABLE trades ADD COLUMN {col} {definition}")
         except sqlite3.OperationalError:
@@ -567,16 +598,16 @@ def fetch_whale_positions(wallet: str, min_size: float) -> list[dict]:
 _WALLET_RE = re.compile(r'^0x[0-9a-fA-F]{40}$')
 
 # Cache leaderboard so we don't re-fetch it every scan
-_leaderboard_cache: tuple[float, set[str]] = (0.0, set())
+_leaderboard_cache: tuple[float, list[str]] = (0.0, [])
 LEADERBOARD_CACHE_TTL = 3600  # seconds
 
-def fetch_profitable_wallet_set(top_n: int = 30) -> set[str]:
-    """Return a set of historically profitable wallet addresses, cached for 1 hour."""
+def fetch_profitable_wallet_list(top_n: int = 30) -> list[str]:
+    """Return profitable wallet addresses ordered by weekly PNL (best first), cached for 1 hour."""
     global _leaderboard_cache
     now = time.time()
-    cached_at, cached_set = _leaderboard_cache
-    if now - cached_at < LEADERBOARD_CACHE_TTL and cached_set:
-        return cached_set
+    cached_at, cached_list = _leaderboard_cache
+    if now - cached_at < LEADERBOARD_CACHE_TTL and cached_list:
+        return cached_list
 
     data = get(f"{DATA_URL}/v1/leaderboard", params={
         "limit":      top_n,
@@ -585,95 +616,110 @@ def fetch_profitable_wallet_set(top_n: int = 30) -> set[str]:
         "orderBy":    "PNL",
     })
     if not data:
-        return cached_set  # return stale cache on failure rather than empty
+        return cached_list  # return stale cache on failure rather than empty
 
     entries = data if isinstance(data, list) else data.get("data", [])
-    wallets = set()
+    wallets = []
+    seen = set()
     for e in entries:
         addr = e.get("proxyWallet") or e.get("address") or e.get("user", "")
-        if addr and _WALLET_RE.match(addr):
-            wallets.add(addr)
+        if addr and _WALLET_RE.match(addr) and addr not in seen:
+            wallets.append(addr)
+            seen.add(addr)
 
     _leaderboard_cache = (now, wallets)
-    log.info(f"Leaderboard refreshed: {len(wallets)} profitable wallets cached")
+    log.info(f"Leaderboard refreshed: {len(wallets)} profitable wallets cached (ordered by PNL)")
     return wallets
 
 
-def get_whale_signal(markets: list[dict]) -> Optional[dict]:
+def get_whale_signals(markets: list[dict]) -> list[dict]:
     """
-    Find a signal by checking current open positions of profitable wallets.
-    Uses /positions endpoint — more reliable than scanning recent trades.
+    Collect all valid whale signals from open positions of profitable wallets.
+    Returns a list of signal dicts (may be empty). Deduplicates by market_id.
     Path A: manually configured WHALE_WALLETS (override).
     Path B: top weekly profitable wallets from leaderboard (auto-discover).
     """
     market_ids = {m["id"]: m for m in markets}
+    signals: list[dict] = []
+    seen_markets: set[str] = set()
+
+    def _make_signal(m, pos, wallet):
+        price = m["yes_price"] if pos["direction"] == "yes" else m["no_price"]
+        if price > CFG["MAX_TRADE_PRICE"]:
+            log.debug(f"🐋 Skipping whale position (price {price:.3f} > MAX_TRADE_PRICE): {m['name'][:50]}")
+            return None
+        if price < CFG["MIN_TRADE_PRICE"]:
+            log.debug(f"🐋 Skipping whale position (price {price:.3f} < MIN_TRADE_PRICE): {m['name'][:50]}")
+            return None
+        if CFG["MAX_WHALE_RESOLVE_HOURS"] > 0:
+            end_date_str = m.get("end_date") or m.get("endDate") or m.get("endDateIso")
+            if end_date_str:
+                try:
+                    end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                    hours_left = (end_dt - datetime.now(timezone.utc)).total_seconds() / 3600
+                    if hours_left > CFG["MAX_WHALE_RESOLVE_HOURS"] or hours_left < 0:
+                        log.debug(f"🐋 Skipping whale position ({hours_left:.0f}h left > MAX_WHALE_RESOLVE_HOURS): {m['name'][:50]}")
+                        return None
+                except ValueError:
+                    pass  # can't parse date, allow it through
+        return {
+            "market":     m,
+            "direction":  pos["direction"],
+            "price":      price,
+            "signal":     "whale-copy",
+            "whale":      wallet,
+            "whale_size": pos["size"],
+            "notes":      f"Whale {wallet[:10]}… holds ${pos['size']:.0f}",
+        }
 
     # ── Path A: configured wallets (manual override) ──────────────────────────
     if CFG["WHALE_WALLETS"]:
         for wallet in CFG["WHALE_WALLETS"][:15]:
             for pos in fetch_whale_positions(wallet, CFG["WHALE_MIN_SIZE"]):
-                if pos["market_id"] in market_ids:
+                if pos["market_id"] in market_ids and pos["market_id"] not in seen_markets:
                     m = market_ids[pos["market_id"]]
-                    log.info(
-                        f"🐋 Whale position (manual): {wallet[:10]}… "
-                        f"{pos['direction'].upper()} on '{m['name'][:50]}' holding ${pos['size']:.0f}"
-                    )
-                    return {
-                        "market":     m,
-                        "direction":  pos["direction"],
-                        "price":      m["yes_price"] if pos["direction"] == "yes" else m["no_price"],
-                        "signal":     "whale-copy",
-                        "whale":      wallet,
-                        "whale_size": pos["size"],
-                        "notes":      f"Whale {wallet[:10]}… holds ${pos['size']:.0f}",
-                    }
+                    sig = _make_signal(m, pos, wallet)
+                    if sig:
+                        log.info(
+                            f"🐋 Whale position (manual): {wallet[:10]}… "
+                            f"{pos['direction'].upper()} on '{m['name'][:50]}' holding ${pos['size']:.0f}"
+                        )
+                        signals.append(sig)
+                        seen_markets.add(pos["market_id"])
             time.sleep(0.15)
-        return None
+        return signals
 
     # ── Path B: positions-based whale discovery ───────────────────────────────
-    # Fetch top weekly profitable wallets, then check what each currently holds.
-    # Positions are current open bets — more reliable than scanning recent trades.
-    profitable = fetch_profitable_wallet_set(top_n=30)
+    profitable = fetch_profitable_wallet_list(top_n=CFG["WHALE_LEADERBOARD_SIZE"])
     if not profitable:
         log.info("Leaderboard unavailable — skipping whale strategy this scan")
-        return None
+        return signals
 
     log.info(f"Scanning positions for {len(profitable)} top weekly wallets (min size=${CFG['WHALE_MIN_SIZE']:.0f})...")
-    wallets = list(profitable)[:15]  # cap API calls at 15 wallets per scan
+    wallets = list(profitable)[:CFG["WHALE_WALLETS_PER_SCAN"]]
     total_positions = 0
     for wallet in wallets:
         positions = fetch_whale_positions(wallet, CFG["WHALE_MIN_SIZE"])
         total_positions += len(positions)
         for pos in positions:
-            # Try pre-filtered list first; if not found, look up the market directly
+            if pos["market_id"] in seen_markets:
+                continue
             m = market_ids.get(pos["market_id"])
             if m is None:
                 m = fetch_market_by_id(pos["market_id"])
                 if m is None:
                     continue
-            signal_price = m["yes_price"] if pos["direction"] == "yes" else m["no_price"]
-            if signal_price > CFG["MAX_TRADE_PRICE"]:
-                log.debug(
-                    f"🐋 Skipping whale position (price {signal_price:.3f} > MAX_TRADE_PRICE): "
-                    f"{m['name'][:50]}"
+            sig = _make_signal(m, pos, wallet)
+            if sig:
+                log.info(
+                    f"🐋 Whale position: {wallet[:10]}… "
+                    f"{pos['direction'].upper()} on '{m['name'][:50]}' @ {sig['price']:.3f} (holding ${pos['size']:.0f})"
                 )
-                continue
-            log.info(
-                f"🐋 Whale position: {wallet[:10]}… "
-                f"{pos['direction'].upper()} on '{m['name'][:50]}' @ {signal_price:.3f} (holding ${pos['size']:.0f})"
-            )
-            return {
-                "market":     m,
-                "direction":  pos["direction"],
-                "price":      signal_price,
-                "signal":     "whale-copy",
-                "whale":      wallet,
-                "whale_size": pos["size"],
-                "notes":      f"Whale {wallet[:10]}… holds ${pos['size']:.0f}",
-            }
+                signals.append(sig)
+                seen_markets.add(pos["market_id"])
         time.sleep(0.15)
-    log.info(f"Whale scan: {total_positions} open positions checked across {len(wallets)} wallets — no signal found")
-    return None
+    log.info(f"Whale scan: {total_positions} open positions checked across {len(wallets)} wallets — {len(signals)} signal(s) found")
+    return signals
 
 # ── Google News — context for Haiku ──────────────────────────────────────────
 _news_cache: dict[str, tuple[float, list[str]]] = {}
@@ -849,8 +895,8 @@ def place_paper_trade(
     con.execute("""
         INSERT INTO trades
             (ts, market_id, market_name, token_id, direction, price, amount,
-             fee, order_type, tags, notes)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+             fee, order_type, tags, notes, end_date, liquidity, volume_24h, market_slug, market_tags)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
         datetime.now(timezone.utc).isoformat(),
         market["id"],
@@ -863,6 +909,11 @@ def place_paper_trade(
         order_type,
         json.dumps(tags),
         notes,
+        market.get("end_date"),
+        market.get("liquidity"),
+        market.get("volume_24h"),
+        market.get("slug"),
+        json.dumps(market.get("tags") or []),
     ))
     con.commit()
     save_budget(new_budget)
@@ -923,13 +974,16 @@ def place_live_trade(
         con.execute("""
             INSERT INTO trades
                 (ts, market_id, market_name, token_id, direction, price, amount,
-                 fee, order_type, tags, notes, mode)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                 fee, order_type, tags, notes, mode,
+                 end_date, liquidity, volume_24h, market_slug, market_tags)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             datetime.now(timezone.utc).isoformat(),
             market["id"], market["name"], token_id,
             direction, price, amount, fee, order_type,
             json.dumps(tags), notes, "live-dry",
+            market.get("end_date"), market.get("liquidity"), market.get("volume_24h"),
+            market.get("slug"), json.dumps(market.get("tags") or []),
         ))
         con.commit()
         save_live_budget(new_budget)
@@ -983,13 +1037,16 @@ def place_live_trade(
     con.execute("""
         INSERT INTO trades
             (ts, market_id, market_name, token_id, direction, price, amount,
-             fee, order_type, tags, notes, mode, order_id)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+             fee, order_type, tags, notes, mode, order_id,
+             end_date, liquidity, volume_24h, market_slug, market_tags)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
         datetime.now(timezone.utc).isoformat(),
         market["id"], market["name"], token_id,
         direction, price, amount, fee, order_type,
         json.dumps(tags), notes, "live", order_id,
+        market.get("end_date"), market.get("liquidity"), market.get("volume_24h"),
+        market.get("slug"), json.dumps(market.get("tags") or []),
     ))
     con.commit()
     save_live_budget(new_budget)
@@ -1145,8 +1202,9 @@ def log_shadow_trade(con, strategy: str, market: dict, direction: str, price: fl
 
     con.execute("""
         INSERT INTO shadow_trades
-            (ts, strategy, market_id, market_name, direction, price, amount, fee, confidence, notes)
-        VALUES (?,?,?,?,?,?,?,?,?,?)
+            (ts, strategy, market_id, market_name, direction, price, amount, fee, confidence, notes,
+             end_date, liquidity, volume_24h, market_slug, market_tags)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
         datetime.now(timezone.utc).isoformat(),
         strategy,
@@ -1158,6 +1216,11 @@ def log_shadow_trade(con, strategy: str, market: dict, direction: str, price: fl
         fee,
         confidence,
         notes,
+        market.get("end_date"),
+        market.get("liquidity"),
+        market.get("volume_24h"),
+        market.get("slug"),
+        json.dumps(market.get("tags") or []),
     ))
     con.commit()
     save_shadow_budget(new_shadow_budget)
@@ -1313,6 +1376,9 @@ def _run_haiku_slot(con, budget: float, markets: list[dict], traded: set,
         conf  = float(analysis.get("confidence") or 0)
         dir_  = analysis.get("direction", "yes")
         price = m["yes_price"] if dir_ == "yes" else m["no_price"]
+        if price < CFG["MIN_TRADE_PRICE"]:
+            log.debug(f"[haiku-analyse] Skipping {m['name'][:50]}: price {price:.3f} < MIN_TRADE_PRICE {CFG['MIN_TRADE_PRICE']:.2f}")
+            continue
         base_conf = CFG["SHADOW_HAIKU_MIN_CONF"] if shadow else CFG["HAIKU_MIN_CONF"]
         min_conf, _ = price_scaled_params(price, base_conf, 0)
         # In shadow mode bypass the edge gate — confidence threshold alone decides.
@@ -1342,11 +1408,9 @@ def _run_haiku_slot(con, budget: float, markets: list[dict], traded: set,
 
 
 def _run_whale_slot(con, budget: float, whale_signal: Optional[dict], traded: set,
-                    confirm_with_haiku: bool, shadow: bool = False) -> tuple[float, int, int]:
+                    shadow: bool = False) -> tuple[float, int, int]:
     """
-    Run a whale-based strategy slot.
-    confirm_with_haiku=False → pure whale-copy
-    confirm_with_haiku=True  → whale+haiku
+    Execute a single whale-copy signal. No Haiku confirmation — whales trade on their own merit.
     Returns (new_budget, signals, trades).
     """
     if not whale_signal or whale_signal["market"]["id"] in traded:
@@ -1355,32 +1419,15 @@ def _run_whale_slot(con, budget: float, whale_signal: Optional[dict], traded: se
     m     = whale_signal["market"]
     dir_  = whale_signal["direction"]
     price = whale_signal["price"]
-    otype = "taker"
-    tags  = ["whale-copy"]
-    notes = whale_signal["notes"]
 
-    if confirm_with_haiku:
-        log.info("[whale+haiku] Confirming whale signal with Haiku...")
-        analysis = haiku_analyse(m)
-        if not analysis:
-            return budget, 1, 0
-        scaled_conf, _ = price_scaled_params(price, CFG["HAIKU_MIN_CONF"], 0)
-        if not analysis.get("edge") or analysis.get("confidence", 0) < scaled_conf:
-            log.info("[whale+haiku] Haiku rejected signal — skipping")
-            return budget, 1, 0
-        tags  = ["whale+haiku"]
-        otype = analysis.get("order_type", "taker")
-        notes += f" | Haiku conf={analysis['confidence']:.2f}: {analysis.get('reasoning','')}"
-    else:
-        log.info("[whale-copy] Copying whale signal directly...")
+    log.info(f"[whale-copy] Copying whale signal: {dir_.upper()} on '{m['name'][:50]}' @ {price:.3f}")
 
     if shadow:
-        conf = float(analysis.get("confidence") or 0) if confirm_with_haiku and analysis else None
-        log_shadow_trade(con, tags[0], m, dir_, price, confidence=conf, notes=notes)
+        log_shadow_trade(con, "whale-copy", m, dir_, price, confidence=None, notes=whale_signal["notes"])
         traded.add(m["id"])
         return budget, 1, 1
 
-    new_budget = _place_trade(con, budget, m, dir_, price, otype, tags, notes)
+    new_budget = _place_trade(con, budget, m, dir_, price, "taker", ["whale-copy"], whale_signal["notes"])
     if new_budget is not None:
         traded.add(m["id"])
         return new_budget, 1, 1
@@ -1422,64 +1469,37 @@ def run_scan(con):
     else:
         traded_this_scan: set = open_market_ids(con)
 
-    # Fetch whale signal once — shared by both whale slots.
-    # Use the full unsampled pool so whale positions aren't limited to the
-    # random 20 markets chosen for Haiku.
-    whale_signal = None
+    # Fetch all whale signals — use the full unsampled pool so whale positions
+    # aren't limited to the random subset chosen for Haiku.
+    whale_signals: list[dict] = []
     if CFG["ENABLE_WHALE_COPY"]:
         log.info("Checking whale wallets...")
         whale_markets = fetch_markets(randomize=False)  # full ranked pool, no random sampling
-        whale_signal = get_whale_signal(whale_markets if whale_markets else markets)
+        whale_signals = get_whale_signals(whale_markets if whale_markets else markets)
 
     if mode == "shadow":
-        # ── Shadow mode: evaluate all 3 strategies, log hypothetical trades ──
-        # No budget is spent. Use results to compare strategies over time.
-        # traded_this_scan is seeded with already-open shadow trades so we don't
-        # double-enter the same position across scans.
-        # whale+haiku uses the pre-scan snapshot so it can still compare against
-        # the same market whale-copy just traded this scan (useful A/B data).
-        pre_scan_traded = set(traded_this_scan)
-
+        # ── Shadow mode: log hypothetical trades for both strategies ──────────
         if CFG["ENABLE_HAIKU"]:
             _, s, t = _run_haiku_slot(con, budget, markets, traded_this_scan, shadow=True)
             signals_found += s; trades_placed += t
 
         if CFG["ENABLE_WHALE_COPY"]:
-            _, s, t = _run_whale_slot(con, budget, whale_signal, traded_this_scan,
-                                      confirm_with_haiku=False, shadow=True)
-            signals_found += s; trades_placed += t
-
-        if CFG["ENABLE_WHALE_COPY"] and CFG["ENABLE_HAIKU"]:
-            _, s, t = _run_whale_slot(con, budget, whale_signal, pre_scan_traded,
-                                      confirm_with_haiku=True, shadow=True)
-            signals_found += s; trades_placed += t
-
-    elif mode == "parallel":
-        # ── Parallel mode: each strategy places real trades independently ─────
-        if CFG["ENABLE_HAIKU"]:
-            budget, s, t = _run_haiku_slot(con, budget, markets, traded_this_scan)
-            signals_found += s; trades_placed += t
-
-        if CFG["ENABLE_WHALE_COPY"]:
-            budget, s, t = _run_whale_slot(con, budget, whale_signal, traded_this_scan,
-                                           confirm_with_haiku=False)
-            signals_found += s; trades_placed += t
-
-        if CFG["ENABLE_WHALE_COPY"] and CFG["ENABLE_HAIKU"]:
-            budget, s, t = _run_whale_slot(con, budget, whale_signal, set(),
-                                           confirm_with_haiku=True)
-            signals_found += s; trades_placed += t
+            whale_cap = CFG["MAX_WHALE_TRADES_PER_SCAN"]
+            for sig in whale_signals[:whale_cap]:
+                _, s, t = _run_whale_slot(con, budget, sig, traded_this_scan, shadow=True)
+                signals_found += s; trades_placed += t
 
     else:
-        # ── Compete / Live mode: strategies share 3 trade slots ──────────────
-        if CFG["ENABLE_WHALE_COPY"] and whale_signal:
-            budget, s, t = _run_whale_slot(
-                con, budget, whale_signal, traded_this_scan,
-                confirm_with_haiku=CFG["ENABLE_HAIKU"],
-            )
-            signals_found += s; trades_placed += t
+        # ── All real-trade modes (compete / parallel / live) ──────────────────
+        # Whale signals run first and are independent of Haiku.
+        # Both strategies share MAX_OPEN_TRADES as the hard cap.
+        if CFG["ENABLE_WHALE_COPY"]:
+            whale_cap = CFG["MAX_WHALE_TRADES_PER_SCAN"]
+            for sig in whale_signals[:whale_cap]:
+                budget, s, t = _run_whale_slot(con, budget, sig, traded_this_scan)
+                signals_found += s; trades_placed += t
 
-        if CFG["ENABLE_HAIKU"] and trades_placed < 3:
+        if CFG["ENABLE_HAIKU"]:
             budget, s, t = _run_haiku_slot(con, budget, markets, traded_this_scan)
             signals_found += s; trades_placed += t
 
