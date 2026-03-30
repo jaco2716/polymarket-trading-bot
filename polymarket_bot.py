@@ -159,15 +159,13 @@ def validate_live_trading_setup():
         test.raise_for_status()
     except Exception as e:
         raise RuntimeError(f"Cannot reach CLOB API: {e}")
-    # Ensure USDC allowances are set for all exchanges (main + neg-risk).
-    # For email accounts (signature_type=1) Polymarket handles the on-chain
-    # approval server-side, so no direct blockchain transaction is needed.
+    # Ensure USDC allowance is set for the main CTF exchange.
     try:
         from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
         client.update_balance_allowance(
             params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         )
-        log.info("USDC allowances updated (covers main + neg-risk exchanges)")
+        log.info("USDC allowance updated")
     except Exception as e:
         log.warning(f"Could not update balance allowance: {e}")
     log.info("Live trading setup validated — CLOB API reachable")
@@ -550,25 +548,6 @@ def fetch_market_by_id(condition_id: str) -> Optional[dict]:
 
 
 
-_neg_risk_cache: dict[str, bool] = {}
-
-def _is_neg_risk(market: dict, direction: str = "yes") -> bool:
-    """Return True if the market's token is a neg-risk token. Cached per token_id."""
-    if CFG["STRATEGY_MODE"] != "live":
-        return False
-    yes_tid, no_tid = resolve_token_ids(market)
-    token_id = yes_tid if direction == "yes" else no_tid
-    if not token_id:
-        return False
-    if token_id in _neg_risk_cache:
-        return _neg_risk_cache[token_id]
-    try:
-        result = get_clob_client().get_neg_risk(token_id)
-        _neg_risk_cache[token_id] = bool(result)
-        return bool(result)
-    except Exception:
-        _neg_risk_cache[token_id] = False
-        return False
 
 
 def resolve_token_ids(market: dict) -> tuple[Optional[str], Optional[str]]:
@@ -1007,16 +986,6 @@ def place_live_trade(
         log.error(f"Cannot resolve {direction} token_id for market {market['id']} — skipping")
         return None
 
-    # Skip neg-risk markets — NegRiskCTFExchange allowance must be set via Polymarket UI first.
-    # To enable: place any trade on a neg-risk market (sports/elections) on polymarket.com,
-    # then remove this block.
-    try:
-        if get_clob_client().get_neg_risk(token_id):
-            log.info(f"Skipping neg-risk market (allowance not set): {market['name'][:50]}")
-            return None
-    except Exception:
-        pass
-
     fee = calc_fee(amount, price, order_type)
     new_budget = budget - amount - fee
 
@@ -1055,6 +1024,13 @@ def place_live_trade(
         from py_clob_client.order_builder.constants import BUY, SELL
 
         client = get_clob_client()
+        is_neg_risk = client.get_neg_risk(token_id)
+        # Neg-risk NO positions cannot be bought directly with USDC — they require
+        # holding YES tokens of every other outcome in the group (NegRiskAdapter conversion).
+        # Skip them; only neg-risk YES positions (BUY yes_tid) are straightforward.
+        if is_neg_risk and direction == "no":
+            log.info(f"Skipping neg-risk NO signal — cannot replicate without multi-outcome logic: {market['name'][:50]}")
+            return None
         side = BUY if direction == "yes" else SELL
 
         mo = MarketOrderArgs(
@@ -1552,8 +1528,6 @@ def run_scan(con):
         if CFG["ENABLE_WHALE_COPY"]:
             whale_cap = CFG["MAX_WHALE_TRADES_PER_SCAN"]
             fresh = [s for s in whale_signals if s["market"]["id"] not in traded_this_scan]
-            if CFG["STRATEGY_MODE"] == "live":
-                fresh = [s for s in fresh if not _is_neg_risk(s["market"], s["direction"])]
             for sig in fresh[:whale_cap]:
                 budget, s, t = _run_whale_slot(con, budget, sig, traded_this_scan)
                 signals_found += s; trades_placed += t
