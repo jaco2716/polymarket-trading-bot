@@ -441,14 +441,15 @@ def fetch_markets(randomize: bool = False) -> list[dict]:
             # Skip if market resolves too far in the future (MAX_RESOLVE_HOURS > 0)
             if CFG["MAX_RESOLVE_HOURS"] > 0:
                 end_date_str = m.get("endDate") or m.get("endDateIso")
-                if end_date_str:
-                    try:
-                        end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
-                        hours_left = (end_dt - datetime.now(timezone.utc)).total_seconds() / 3600
-                        if hours_left > CFG["MAX_RESOLVE_HOURS"] or hours_left < 0:
-                            continue
-                    except ValueError:
-                        pass  # can't parse date, allow it through
+                if not end_date_str:
+                    continue  # no end date — skip rather than allow unknown-duration markets
+                try:
+                    end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                    hours_left = (end_dt - datetime.now(timezone.utc)).total_seconds() / 3600
+                    if hours_left > CFG["MAX_RESOLVE_HOURS"] or hours_left < 0:
+                        continue
+                except ValueError:
+                    continue  # unparseable date — skip to be safe
 
             tokens = m.get("tokens") or m.get("clobTokenIds") or []
             # clobTokenIds may arrive as a JSON string — parse it
@@ -979,6 +980,46 @@ def place_paper_trade(
 
 
 # ── Live trade engine ─────────────────────────────────────────────────────────
+def get_actual_fill_price(client, order_id: str, amount_usdc: float, fallback: float) -> float:
+    """Query CLOB API for actual fill price after a FOK order executes.
+    Computes: amount_usdc / size_matched. Falls back to analysis price on failure."""
+    try:
+        order = client.get_order(order_id)
+        if not isinstance(order, dict):
+            return fallback
+        size_matched = (
+            order.get("size_matched") or
+            order.get("sizeMatched") or
+            order.get("matched_amount") or
+            order.get("matchedAmount")
+        )
+        if size_matched and float(size_matched) > 0:
+            return round(amount_usdc / float(size_matched), 6)
+    except Exception as e:
+        log.debug(f"Could not fetch fill price for order {order_id}: {e}")
+    return fallback
+
+
+def repair_open_trade_prices(con) -> None:
+    """Backfill actual fill prices for open live trades that have an order_id stored."""
+    rows = con.execute(
+        "SELECT id, order_id, amount FROM trades WHERE resolved=0 AND mode='live' AND order_id IS NOT NULL"
+    ).fetchall()
+    if not rows:
+        return
+    try:
+        client = get_clob_client()
+    except Exception as e:
+        log.debug(f"repair_open_trade_prices: could not get CLOB client: {e}")
+        return
+    for row_id, order_id, amount in rows:
+        fill_price = get_actual_fill_price(client, order_id, amount, fallback=None)
+        if fill_price:
+            con.execute("UPDATE trades SET price=? WHERE id=?", (fill_price, row_id))
+            log.info(f"Repaired trade #{row_id}: fill price set to {fill_price:.4f}")
+    con.commit()
+
+
 def place_live_trade(
     con, budget: float,
     market: dict,
@@ -1074,11 +1115,14 @@ def place_live_trade(
         elif hasattr(resp, "orderID"):
             order_id = resp.orderID
 
+        # Resolve actual fill price (market orders execute at book price, not analysis price)
+        fill_price = get_actual_fill_price(client, order_id, amount, price) if order_id else price
+
         size_pct = round(amount / base_amount * 100) if base_amount > 0 else 100
         log.info(
             f"💰 LIVE trade placed!\n"
             f"   Market:   {market['name'][:60]}\n"
-            f"   {direction.upper()} @ {price:.3f}  |  ${amount:.2f} staked ({size_pct}% of base)\n"
+            f"   {direction.upper()} @ analysis {price:.3f} → fill {fill_price:.3f}  |  ${amount:.2f} staked ({size_pct}% of base)\n"
             f"   Order ID: {order_id}\n"
             f"   Tags:     {', '.join(tags)}\n"
             f"   Budget:   ${budget:.2f} → ${new_budget:.2f}"
@@ -1099,7 +1143,7 @@ def place_live_trade(
     """, (
         datetime.now(timezone.utc).isoformat(),
         market["id"], market["name"], token_id,
-        direction, price, amount, fee, order_type,
+        direction, fill_price, amount, fee, order_type,
         json.dumps(tags), notes, "live", order_id,
         market.get("end_date"), market.get("liquidity"), market.get("volume_24h"),
         market.get("slug"), json.dumps(market.get("tags") or []),
@@ -1445,6 +1489,9 @@ def _run_haiku_slot(con, budget: float, markets: list[dict], traded: set,
         if shadow:
             log_shadow_trade(con, "haiku-analyse", m, dir_, price,
                              confidence=conf, notes=analysis.get("reasoning", ""))
+            trades += 1
+            traded.add(m["id"])
+            break  # one trade per slot
         else:
             otype = analysis.get("order_type", "maker")
             new_budget = _place_trade(
@@ -1453,9 +1500,9 @@ def _run_haiku_slot(con, budget: float, markets: list[dict], traded: set,
             )
             if new_budget is not None:
                 budget = new_budget
-        trades += 1
-        traded.add(m["id"])
-        break  # one trade per slot
+                trades += 1
+                traded.add(m["id"])
+                break  # one trade per slot
     return budget, signals, trades
 
 
@@ -1623,6 +1670,8 @@ def main():
             sys.exit(1)
 
     con = init_db()
+    if mode == "live":
+        repair_open_trade_prices(con)
     try:
         budget = _load_mode_budget()
         log.info(f"Starting budget: ${budget:.2f} USDC")
