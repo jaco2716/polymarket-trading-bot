@@ -505,10 +505,7 @@ function renderTradesTable() {
       return `
         <tr class="row" style="border-top:1px solid #21262d">
           <td class="px-3 py-2 muted">${t.id}</td>
-          <td class="px-3 py-2" style="max-width:280px">
-            <div style="overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;line-height:1.4">${t.market_name}</div>
-            ${t.notes ? `<div style="overflow:hidden;display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;color:#8b949e;margin-top:2px">${t.notes}</div>` : ''}
-          </td>
+          <td class="px-3 py-2" style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${t.notes ? t.market_name + ' — ' + t.notes : t.market_name}">${t.market_name}</td>
           <td class="px-3 py-2 text-center">${dirBadge}</td>
           <td class="px-3 py-2 text-right muted">${t.price != null ? (t.price * 100).toFixed(1) + '%' : '—'}</td>
           <td class="px-3 py-2 text-right muted">
@@ -567,7 +564,7 @@ function renderTradesTable() {
     return `
       <tr class="row" style="border-top:1px solid #21262d">
         <td class="px-3 py-2 muted">${t.id}</td>
-        <td class="px-3 py-2" style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${t.market_name}">${modeBadge}${t.market_name}</td>
+        <td class="px-3 py-2" style="max-width:260px;overflow:hidden;" title="${t.market_name}">${modeBadge}${t.market_name}</td>
         <td class="px-3 py-2 text-center">${dirBadge}</td>
         <td class="px-3 py-2 text-right muted">${t.price != null ? (t.price * 100).toFixed(1) + '%' : '—'}</td>
         <td class="px-3 py-2 text-right">
