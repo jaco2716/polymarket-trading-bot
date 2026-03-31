@@ -451,6 +451,12 @@ def fetch_markets(randomize: bool = False) -> list[dict]:
                         pass  # can't parse date, allow it through
 
             tokens = m.get("tokens") or m.get("clobTokenIds") or []
+            # clobTokenIds may arrive as a JSON string — parse it
+            if isinstance(tokens, str):
+                try:
+                    tokens = json.loads(tokens)
+                except (ValueError, TypeError):
+                    tokens = []
             yes_token_id = None
             no_token_id  = None
             if tokens:
@@ -802,22 +808,23 @@ def get_haiku_client():
         _haiku_client = anthropic.Anthropic(api_key=CFG["ANTHROPIC_API_KEY"])
     return _haiku_client
 
-HAIKU_SYSTEM = """You are a prediction market analyst. Given a market, decide if there is a clear positive edge to trade.
+def _build_haiku_system() -> str:
+    threshold = CFG["HAIKU_MIN_CONF"]
+    return f"""You are a prediction market analyst. Given a market and recent news, estimate the probability of the YES outcome resolving true.
 
 Reply ONLY with valid JSON — no prose, no markdown fences:
-{
+{{
   "edge": true | false,
   "direction": "yes" | "no",
   "confidence": 0.0-1.0,
-  "reasoning": "one sentence citing the specific fact that justifies the edge",
+  "reasoning": "one sentence citing the specific fact or signal behind your estimate",
   "order_type": "maker" | "taker"
-}
+}}
 
 Rules:
-- Only say edge:true if you can cite a SPECIFIC piece of news or data showing the market is mispriced.
-- "No clear signal", "market appears efficient", or "insufficient information" means edge:false, not edge:true.
+- Set confidence to your honest probability estimate for the direction you choose.
+- Set edge:true if confidence >= {threshold}, edge:false otherwise.
 - Do not have a directional bias — evaluate YES and NO equally based on evidence alone.
-- Only say edge:true if confidence >= 0.60.
 - Prefer "maker" orders (limit orders) to save on fees."""
 
 def _haiku_system_shadow() -> str:
@@ -860,7 +867,7 @@ def haiku_analyse(market: dict, shadow: bool = False) -> Optional[dict]:
         "mispriced? If you have no strong signal, say edge:false."
     )
 
-    system = _haiku_system_shadow() if shadow else HAIKU_SYSTEM
+    system = _haiku_system_shadow() if shadow else _build_haiku_system()
 
     try:
         resp = client.messages.create(
@@ -1007,6 +1014,11 @@ def place_live_trade(
         log.error(f"Cannot resolve {direction} token_id for market {market['id']} — skipping")
         return None
 
+    # Skip neg-risk markets — they require different token accounting not supported via API.
+    if _is_neg_risk(market, direction):
+        log.info(f"Skipping neg-risk market: {market['name'][:50]}")
+        return None
+
     fee = calc_fee(amount, price, order_type)
     new_budget = budget - amount - fee
 
@@ -1045,9 +1057,6 @@ def place_live_trade(
         from py_clob_client.order_builder.constants import BUY, SELL
 
         client = get_clob_client()
-        if client.get_neg_risk(token_id):
-            log.info(f"Skipping neg-risk market: {market['name'][:50]}")
-            return None
         side = BUY if direction == "yes" else SELL
 
         mo = MarketOrderArgs(
@@ -1429,14 +1438,9 @@ def _run_haiku_slot(con, budget: float, markets: list[dict], traded: set,
             continue
         base_conf = CFG["SHADOW_HAIKU_MIN_CONF"] if shadow else CFG["HAIKU_MIN_CONF"]
         min_conf, _ = price_scaled_params(price, base_conf, 0)
-        # In shadow mode bypass the edge gate — confidence threshold alone decides.
-        # In real mode both edge=true AND confidence threshold must pass.
-        if shadow:
-            if conf < min_conf:
-                continue
-        else:
-            if not analysis.get("edge") or conf < min_conf:
-                continue
+        # Confidence threshold is the sole gate — edge field is informational only.
+        if conf < min_conf:
+            continue
         signals += 1
         if shadow:
             log_shadow_trade(con, "haiku-analyse", m, dir_, price,
